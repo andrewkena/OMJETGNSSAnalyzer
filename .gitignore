@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE
+.idea/
+
+# PyInstaller build output
+build/
+dist/
+*.spec
+
+# Mission data (raw binary input + generated output) -- kept out of git,
+# some of these files exceed GitHub's 100MB per-file limit.
+data/
+
+# Generated reports/plots left at the repo root by older runs
+photo_satellite_report.csv
+mission_report.txt
+mission_report.pdf
+satellites.png
+photo_intervals.png
+photo_histogram.png
