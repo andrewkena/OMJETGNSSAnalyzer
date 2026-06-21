@@ -1,4 +1,5 @@
 import os
+import sys
 import queue
 import threading
 import traceback
@@ -14,7 +15,11 @@ from PIL import Image, ImageTk
 
 from core.pipeline import run_pipeline
 
-ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+APP_VERSION = "0.1"
+APP_AUTHOR = "andrewkena"
+
+BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 LOGO_PATH = os.path.join(ASSETS_DIR, "logo.png")
 ICON_PATH = os.path.join(ASSETS_DIR, "OMJ_pin.ico")
 
@@ -54,6 +59,8 @@ QUALITY_COLOR = {
 
 HELP_TEXT = """\
 OMJET GNSS ANALYZER
+====================================================================
+Версия: {version}        Автор: {author}
 ====================================================================
 
 НАЗНАЧЕНИЕ ПРОГРАММЫ
@@ -219,7 +226,7 @@ class GnssAnalyzerApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("OMJET GNSS Analyzer")
+        self.root.title(f"OMJET GNSS Analyzer v{APP_VERSION}")
         self.root.geometry("700x1200")
 
         self.cnb_file = None
@@ -275,7 +282,7 @@ class GnssAnalyzerApp:
         text = scrolledtext.ScrolledText(window, wrap=tk.WORD, font=("Consolas", 10))
         text.configure(background=theme["text_bg"], foreground=theme["text_fg"])
         text.pack(fill=tk.BOTH, expand=True)
-        text.insert(tk.END, HELP_TEXT)
+        text.insert(tk.END, HELP_TEXT.format(version=APP_VERSION, author=APP_AUTHOR))
         text.configure(state=tk.DISABLED)
 
     def _set_window_icon(self):

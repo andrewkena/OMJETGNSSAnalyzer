@@ -6,9 +6,10 @@ __pycache__/
 # IDE
 .idea/
 
-# PyInstaller build output
+# PyInstaller build output (the finished .exe is tracked explicitly below)
 build/
-dist/
+dist/*
+!dist/OMJET_GNSS_Analyzer.exe
 *.spec
 
 # Mission data (raw binary input + generated output) -- kept out of git,
