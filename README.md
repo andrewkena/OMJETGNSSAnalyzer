@@ -154,6 +154,13 @@ pyinstaller --noconfirm --onefile --windowed --name "OMJET_GNSS_Analyzer" --icon
   координат.
 - Просмотр PDF-отчёта открывается во внешней программе по умолчанию.
 
+## Android-версия (прототип)
+
+В папке [`android/`](android/) — нативный Android-проект (Kotlin + встроенный
+Python через Chaquopy), переиспользующий декодер `core/novatel/` и анализ
+миссии. Графики/PDF в мобильной версии пока не реализованы. Подробности и
+инструкция по сборке — в [`android/README.md`](android/README.md).
+
 ## Структура проекта
 
 ```

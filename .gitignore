@@ -23,3 +23,15 @@ mission_report.pdf
 satellites.png
 photo_intervals.png
 photo_histogram.png
+
+# Android (Gradle/Android Studio)
+android/.gradle/
+android/local.properties
+android/.idea/
+android/.kotlin/
+android/app/.cxx/
+android/captures/
+*.iml
+android/gradlew
+android/gradlew.bat
+android/gradle/wrapper/gradle-wrapper.jar
