@@ -23,7 +23,7 @@ from core.obs_header_reader import read_obs_signal_types, system_name
 from plots.satellites_plot import SatellitesPlot
 from plots.timemark_interval_plot import TimemarkIntervalPlot
 from plots.timemark_histogram import TimemarkHistogram
-from plots.mission_trajectory_plot import MissionTrajectoryPlot
+from plots.mission_trajectory_plot import MissionTrajectoryPlot, DEFAULT_BASEMAP
 from plots.altitude_profile_plot import AltitudeProfilePlot
 from plots.pdop_plot import PdopPlot
 
@@ -168,7 +168,7 @@ def _pdop_summary(pdop_series):
     }
 
 
-def run_pipeline(cnb_file, progress_callback=None):
+def run_pipeline(cnb_file, progress_callback=None, basemap=None):
     obs_file = cnb_file + ".obs"
 
     runner = ProjectRunner(cnb_file)
@@ -261,7 +261,10 @@ def run_pipeline(cnb_file, progress_callback=None):
     trajectory_png = None
     if trajectory_points:
         trajectory_png = os.path.join(runner.plots_dir, "trajectory.png")
-        MissionTrajectoryPlot(trajectory_points, photo_points, trajectory_png).show()
+        MissionTrajectoryPlot(
+            trajectory_points, photo_points, trajectory_png,
+            basemap=basemap or DEFAULT_BASEMAP
+        ).show()
 
     if sat_result["avg_satellites"] >= 20:
         gnss_quality = "EXCELLENT"
@@ -317,6 +320,7 @@ def run_pipeline(cnb_file, progress_callback=None):
         "sat_result": sat_result,
         "photo_quality": quality,
         "photo_report": report,
+        "matched_fixes": matched_fixes,
         "mission_data": mission_data,
         "mission_text": mission_text,
         "trajectory": {

@@ -14,8 +14,9 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from PIL import Image, ImageTk
 
 from core.pipeline import run_pipeline
+from plots.mission_trajectory_plot import BASEMAP_KEYS, DEFAULT_BASEMAP
 
-APP_VERSION = "0.1"
+APP_VERSION = "0.2_10.07.2026"
 APP_AUTHOR = "andrewkena"
 
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -227,15 +228,20 @@ class GnssAnalyzerApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"OMJET GNSS Analyzer v{APP_VERSION}")
-        self.root.geometry("700x1200")
+        self.root.geometry("1000x1000")
 
         self.cnb_file = None
         self.result = None
         self.plot_images = []
         self.overview_photo = None
         self._trajectory_pil_image = None
-        self._trajectory_last_width = 0
+        self._map_canvas = None
+        self._map_zoom = 1.0
+        self._map_offset_x = 0.0
+        self._map_offset_y = 0.0
+        self._map_drag_prev = None
         self.dark_mode = tk.BooleanVar(value=False)
+        self._basemap_var = tk.StringVar(value=DEFAULT_BASEMAP)
         self._text_widgets = []
         self._canvases = []
         self._queue = queue.Queue()
@@ -449,17 +455,43 @@ class GnssAnalyzerApp:
         # Lives outside the Notebook so it stays visible no matter which tab is selected.
         frame = ttk.Frame(self.main_paned, padding=(0, 4, 0, 0))
 
+        header = ttk.Frame(frame)
+        header.pack(side=tk.TOP, fill=tk.X)
+
         ttk.Label(
-            frame,
+            header,
             text="Траектория миссии",
             font=("Segoe UI", 11, "bold")
-        ).pack(side=tk.TOP, anchor=tk.W)
+        ).pack(side=tk.LEFT)
 
-        image_label = ttk.Label(frame)
-        image_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(4, 0))
-        frame.bind("<Configure>", self._on_overview_resize)
+        ttk.Label(header, text="  Подложка:").pack(side=tk.LEFT)
+        basemap_cb = ttk.Combobox(
+            header,
+            textvariable=self._basemap_var,
+            values=BASEMAP_KEYS,
+            state="readonly",
+            width=22,
+        )
+        basemap_cb.pack(side=tk.LEFT, padx=(4, 0))
+        basemap_cb.bind("<<ComboboxSelected>>", self._on_basemap_changed)
 
-        return frame, image_label
+        canvas = tk.Canvas(frame, bg="#222", highlightthickness=0)
+        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        canvas.bind("<Configure>", self._on_map_configure)
+        canvas.bind("<ButtonPress-1>", self._on_map_drag_start)
+        canvas.bind("<B1-Motion>", self._on_map_drag)
+        canvas.bind("<MouseWheel>", self._on_map_scroll)        # Windows
+        canvas.bind("<Button-4>", self._on_map_scroll)          # Linux scroll up
+        canvas.bind("<Button-5>", self._on_map_scroll)          # Linux scroll down
+
+        self._map_canvas = canvas
+        self._map_zoom = 1.0
+        self._map_offset_x = 0.0
+        self._map_offset_y = 0.0
+        self._map_drag_prev = None
+
+        return frame, canvas
 
     def _make_overview_tab(self, title):
         frame = ttk.Frame(self.notebook)
@@ -587,21 +619,28 @@ class GnssAnalyzerApp:
             return
 
         obs_path = path + ".obs"
-        if not os.path.isfile(obs_path):
-            messagebox.showerror(
-                "Файл не найден",
-                f"Рядом с выбранным файлом не найден RINEX OBS:\n\n"
-                f"{obs_path}\n\n"
-                f"Сконвертируйте .cnb в RINEX с помощью утилиты производителя "
-                f"(CnbConverter / NovAtel Convert) — должен появиться файл "
-                f"с именем «{os.path.basename(path)}.obs» в той же папке."
-            )
-            return
+        obs_missing = not os.path.isfile(obs_path)
 
         self.cnb_file = path
         self.file_label.configure(text=os.path.basename(path))
-        self.analyze_button.configure(state=tk.NORMAL)
-        self.status_var.set(f"Выбран файл: {path}")
+
+        if obs_missing:
+            self.analyze_button.configure(state=tk.DISABLED)
+            self.status_var.set(
+                f"⚠ Не найден {os.path.basename(obs_path)} — конвертируйте .cnb в RINEX OBS"
+            )
+            messagebox.showwarning(
+                "Отсутствует файл OBS",
+                f"Файл наблюдений RINEX OBS не найден:\n\n"
+                f"{obs_path}\n\n"
+                f"Сконвертируйте .cnb с помощью утилиты производителя "
+                f"(CnbConverter / NovAtel Convert). Файл должен называться\n"
+                f"«{os.path.basename(obs_path)}» и лежать в той же папке.\n\n"
+                f"После появления файла выберите .cnb снова."
+            )
+        else:
+            self.analyze_button.configure(state=tk.NORMAL)
+            self.status_var.set(f"Выбран файл: {path}")
 
     def run_analysis(self):
         if not self.cnb_file:
@@ -647,9 +686,48 @@ class GnssAnalyzerApp:
 
         self.root.after(100, self._poll_queue)
 
+    def _on_basemap_changed(self, _event=None):
+        if self.result is None:
+            return
+        basemap = self._basemap_var.get()
+        trajectory_png = self.result["plots"].get("trajectory")
+        if not trajectory_png:
+            return
+
+        from plots.mission_trajectory_plot import MissionTrajectoryPlot
+        traj = self.result["trajectory"]
+        photo_report = self.result["photo_report"]
+        traj_pts = traj["points"]
+        matched_fixes = self.result.get("matched_fixes", [])
+        photo_points = [
+            {**fix, "quality": photo_report[i]["quality"]}
+            for i, fix in enumerate(matched_fixes)
+        ]
+
+        def _rebuild():
+            try:
+                MissionTrajectoryPlot(traj_pts, photo_points, trajectory_png, basemap=basemap).show()
+                img = Image.open(trajectory_png)
+                self.root.after(0, lambda: self._set_trajectory_image(img))
+            except Exception:
+                pass
+
+        threading.Thread(target=_rebuild, daemon=True).start()
+
+    def _set_trajectory_image(self, img):
+        self._trajectory_pil_image = img
+        self._map_zoom = 1.0
+        self._map_offset_x = 0.0
+        self._map_offset_y = 0.0
+        self._map_redraw()
+
     def _run_analysis_worker(self):
         try:
-            result = run_pipeline(self.cnb_file, progress_callback=self._on_progress)
+            result = run_pipeline(
+                self.cnb_file,
+                progress_callback=self._on_progress,
+                basemap=self._basemap_var.get(),
+            )
         except Exception as exc:
             error_text = traceback.format_exc()
             self._queue.put(("error", exc, error_text))
@@ -769,35 +847,68 @@ class GnssAnalyzerApp:
             self._trajectory_pil_image = Image.open(trajectory_png)
         else:
             self._trajectory_pil_image = None
-            self.overview_photo = None
-            self.overview_image_label.configure(image="")
+            if self._map_canvas:
+                self._map_canvas.delete("all")
 
-        self._trajectory_last_width = 0
-        self._render_overview_image()
+        self._map_zoom = 1.0
+        self._map_offset_x = 0.0
+        self._map_offset_y = 0.0
+        self._map_redraw()
 
-    def _on_overview_resize(self, event):
-        self._render_overview_image(event.width)
+    def _on_map_configure(self, event):
+        self._map_redraw()
 
-    def _render_overview_image(self, width=None):
-        if self._trajectory_pil_image is None:
+    def _on_map_drag_start(self, event):
+        self._map_drag_prev = (event.x, event.y)
+
+    def _on_map_drag(self, event):
+        if self._map_drag_prev is None:
+            return
+        dx = event.x - self._map_drag_prev[0]
+        dy = event.y - self._map_drag_prev[1]
+        self._map_offset_x += dx
+        self._map_offset_y += dy
+        self._map_drag_prev = (event.x, event.y)
+        self._map_redraw()
+
+    def _on_map_scroll(self, event):
+        if event.num == 4:
+            delta = 1
+        elif event.num == 5:
+            delta = -1
+        else:
+            delta = 1 if event.delta > 0 else -1
+
+        factor = 1.15 if delta > 0 else 1 / 1.15
+        cx, cy = event.x, event.y
+        self._map_offset_x = cx + (self._map_offset_x - cx) * factor
+        self._map_offset_y = cy + (self._map_offset_y - cy) * factor
+        self._map_zoom *= factor
+        self._map_redraw()
+
+    def _map_redraw(self):
+        if self._map_canvas is None or self._trajectory_pil_image is None:
+            return
+        canvas = self._map_canvas
+        cw = canvas.winfo_width()
+        ch = canvas.winfo_height()
+        if cw < 2 or ch < 2:
             return
 
-        if width is None:
-            width = self.trajectory_panel.winfo_width()
+        src = self._trajectory_pil_image
+        base_w = cw
+        base_h = int(src.height * cw / src.width)
 
-        width = max(width - 4, 1)
-        if width <= 1 or width == self._trajectory_last_width:
-            return
+        w = max(int(base_w * self._map_zoom), 1)
+        h = max(int(base_h * self._map_zoom), 1)
 
-        self._trajectory_last_width = width
-
-        source = self._trajectory_pil_image
-        ratio = source.height / source.width
-        height = max(int(width * ratio), 1)
-
-        resized = source.resize((width, height), Image.LANCZOS)
+        resized = src.resize((w, h), Image.LANCZOS)
         self.overview_photo = ImageTk.PhotoImage(resized)
-        self.overview_image_label.configure(image=self.overview_photo)
+
+        canvas.delete("all")
+        x = int(self._map_offset_x)
+        y = int(self._map_offset_y)
+        canvas.create_image(x, y, anchor=tk.NW, image=self.overview_photo)
 
     def _fill_satellites(self, result):
         sat = result["sat_result"]
@@ -848,16 +959,20 @@ class GnssAnalyzerApp:
     def _fill_photo_quality(self, result):
         quality = result["photo_quality"]
 
+        excluded = quality.get("excluded_count", 0)
+        cluster_size = quality.get("cluster_size", 0)
         lines = [
             "КАЧЕСТВО ФОТОСЪЁМКИ",
             "=" * 50,
             "",
-            f"Номинальный интервал : {quality['median_interval']:.3f} сек",
-            f"Стд. отклонение      : {quality['std_dev']:.3f} сек",
-            f"95-й перцентиль      : {quality['p95']:.3f} сек",
-            f"Самый большой разрыв : {quality['longest_gap']:.3f} сек",
-            f"Количество разрывов  : {quality['gap_count']}",
-            ("quality", "Качество             : ", quality["quality"], "photo_quality"),
+            f"Фото в основном массиве : {cluster_size}",
+            f"Точек на удалении       : {excluded}" if excluded else "",
+            f"Номинальный интервал    : {quality['median_interval']:.3f} сек",
+            f"Стд. отклонение         : {quality['std_dev']:.3f} сек",
+            f"95-й перцентиль         : {quality['p95']:.3f} сек",
+            f"Самый большой разрыв    : {quality['longest_gap']:.3f} сек",
+            f"Количество разрывов     : {quality['gap_count']}",
+            ("quality", "Качество (без удалённых): ", quality["quality"], "photo_quality"),
         ]
         self._render_lines(self.tab_photo, lines)
 
