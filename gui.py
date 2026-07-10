@@ -722,8 +722,8 @@ class GnssAnalyzerApp:
                 MissionTrajectoryPlot(traj_pts, photo_points, trajectory_png, basemap=basemap).show()
                 img = Image.open(trajectory_png)
                 self.root.after(0, lambda: self._set_trajectory_image(img))
-            except Exception:
-                pass
+            except Exception as e:
+                self.root.after(0, lambda: self.status_var.set(f"Ошибка подложки: {e}"))
 
         threading.Thread(target=_rebuild, daemon=True).start()
 
