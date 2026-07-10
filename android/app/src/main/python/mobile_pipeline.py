@@ -87,9 +87,15 @@ def analyze(cnb_path, obs_path, csv_out_path):
 
     quality = PhotoQuality(tm["timemarks"]).analyze()
 
+    matched_fixes = []
+    for t in tm["timemarks"]:
+        if trajectory_points:
+            closest = min(trajectory_points, key=lambda p: abs((p["time"] - t).total_seconds()))
+            matched_fixes.append(closest)
+
     photo_result = PhotoSatelliteReport(
         tm["timemarks"], sat_result["epoch_times"], sat_result["epoch_sat_counts"],
-        csv_out_path
+        csv_out_path, fixes=matched_fixes,
     ).analyze()
 
     report = photo_result["report"]

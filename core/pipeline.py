@@ -242,7 +242,8 @@ def run_pipeline(cnb_file, progress_callback=None):
         tm["timemarks"],
         sat_result["epoch_times"],
         sat_result["epoch_sat_counts"],
-        csv_path
+        csv_path,
+        fixes=matched_fixes,
     ).analyze()
 
     report = photo_result["report"]
