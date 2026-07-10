@@ -22,7 +22,7 @@ APP_AUTHOR = "andrewkena"
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 LOGO_PATH = os.path.join(ASSETS_DIR, "logo.png")
-ICON_PATH = os.path.join(ASSETS_DIR, "OMJ_pin.ico")
+ICON_PATH = os.path.join(ASSETS_DIR, "GNSS_logo.ico")
 
 LIGHT_THEME = {
     "bg": "#f0f0f0",
