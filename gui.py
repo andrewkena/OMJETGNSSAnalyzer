@@ -223,6 +223,20 @@ class Tooltip:
             self.tip = None
 
 
+def _windows_dark_mode():
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        )
+        value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return value == 0  # 0 = тёмная, 1 = светлая
+    except Exception:
+        return False
+
+
 class GnssAnalyzerApp:
 
     def __init__(self, root):
@@ -240,7 +254,7 @@ class GnssAnalyzerApp:
         self._map_offset_x = 0.0
         self._map_offset_y = 0.0
         self._map_drag_prev = None
-        self.dark_mode = tk.BooleanVar(value=False)
+        self.dark_mode = tk.BooleanVar(value=_windows_dark_mode())
         self._basemap_var = tk.StringVar(value=DEFAULT_BASEMAP)
         self._text_widgets = []
         self._canvases = []
@@ -250,7 +264,6 @@ class GnssAnalyzerApp:
         self.style.theme_use("clam")
 
         self._set_window_icon()
-        self._build_logo_bar()
         self._build_top_bar()
         self._build_progress_bar()
         self._build_status_bar()
@@ -414,12 +427,12 @@ class GnssAnalyzerApp:
         self.trajectory_panel, self.overview_image_label = self._build_trajectory_panel()
         self.main_paned.add(self.trajectory_panel, weight=2)
 
-        self.tab_overview_left, self.tab_overview_right = self._make_overview_tab("1. Обзор миссии")
-        self.tab_satellites = self._make_text_tab("2. Спутники")
-        self.tab_photo = self._make_text_tab("3. Качество фото")
-        self.tab_report = self._make_text_tab("4. Итоговый отчёт")
-        self.tab_plots = self._make_plots_tab("5. Графики")
-        self.tab_files = self._make_files_tab("6. Файлы результата")
+        self.tab_overview_left, self.tab_overview_right = self._make_overview_tab("Обзор миссии")
+        self.tab_satellites = self._make_text_tab("Спутники")
+        self.tab_photo = self._make_text_tab("Качество фото")
+        self.tab_report = self._make_text_tab("Итоговый отчёт")
+        self.tab_plots = self._make_plots_tab("Графики")
+        self.tab_files = self._make_files_tab("Файлы результата")
 
         self.notebook.bind(
             "<<NotebookTabChanged>>",
@@ -787,7 +800,7 @@ class GnssAnalyzerApp:
             f"Время окончания    : {end}",
             f"Длительность полёта: {mission['flight_duration_min']:.1f} мин",
             f"Интервал записи    : {time_result['median_interval']:.3f} сек ({time_result['nominal_rate_hz']:.1f} Гц)",
-            f"Количество фото    : {mission['photo_count']}",
+            f"Количество фото    : {mission['photo_count']}{self._filtered_photo_label(result)}",
             f"Уникальных спутников: {mission['unique_satellites']}",
         ]
 
@@ -1053,6 +1066,32 @@ class GnssAnalyzerApp:
             command=lambda: self._open_folder(reports_dir)
         ).pack(side=tk.LEFT)
 
+        # --- фильтр по высоте ---
+        filter_frame = ttk.Frame(self.tab_files, padding=(8, 6, 8, 0))
+        filter_frame.pack(side=tk.TOP, fill=tk.X)
+
+        self._filter_height_var = tk.BooleanVar(value=True)
+
+        ttk.Checkbutton(
+            filter_frame,
+            text="Отфильтровать метки по высоте",
+            variable=self._filter_height_var,
+            command=lambda: self._rewrite_csv(result),
+        ).pack(side=tk.LEFT)
+
+        tooltip_text = (
+            "При включении из CSV-отчёта исключаются геометки,\n"
+            "высота которых отличается от средней высоты полёта\n"
+            "более чем на 10%.\n\n"
+            "Это позволяет убрать снимки, сделанные на взлёте\n"
+            "или посадке, которые не входят в рабочий маршрут."
+        )
+        icon = self._make_help_icon(filter_frame, tooltip_text)
+        filter_frame.after(10, lambda: icon.pack(side=tk.LEFT, padx=(4, 0)))
+
+        # применяем фильтр сразу при открытии вкладки
+        self._rewrite_csv(result)
+
         ttk.Label(
             self.tab_files,
             text="СОХРАНЁННЫЕ ФАЙЛЫ",
@@ -1079,6 +1118,47 @@ class GnssAnalyzerApp:
                 row, text="Просмотр",
                 command=lambda p=path: self._view_file(p)
             ).pack(side=tk.RIGHT, padx=4)
+
+    def _filtered_photo_label(self, result):
+        report = result["photo_report"]
+        heights = [r["height"] for r in report if r.get("height") is not None]
+        if not heights:
+            return ""
+        avg_h = sum(heights) / len(heights)
+        threshold = avg_h * 0.10
+        count = sum(1 for r in report
+                    if r.get("height") is not None and abs(r["height"] - avg_h) <= threshold)
+        return f"  (отфильтровано: {count})"
+
+    def _rewrite_csv(self, result):
+        import csv as _csv
+        report = result["photo_report"]
+        csv_path = result["files"]["csv"]
+
+        if self._filter_height_var.get():
+            heights = [r.get("height") for r in report if r.get("height") is not None]
+            if heights:
+                avg_h = sum(heights) / len(heights)
+                threshold = avg_h * 0.10
+                rows = [r for r in report if r.get("height") is None
+                        or abs(r["height"] - avg_h) <= threshold]
+            else:
+                rows = report
+        else:
+            rows = report
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = _csv.writer(f)
+            writer.writerow(["PhotoID", "Time", "Latitude", "Longitude", "Height_m",
+                             "Satellites", "Quality"])
+            for r in rows:
+                writer.writerow([
+                    r["photo_id"], r["time"],
+                    f"{r['lat']:.8f}" if r.get("lat") is not None else "",
+                    f"{r['lon']:.8f}" if r.get("lon") is not None else "",
+                    f"{r['height']:.3f}" if r.get("height") is not None else "",
+                    r["satellites"], r["quality"],
+                ])
 
     def _open_folder(self, path):
         if not os.path.isdir(path):
