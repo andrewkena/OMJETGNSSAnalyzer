@@ -586,6 +586,18 @@ class GnssAnalyzerApp:
         if not path:
             return
 
+        obs_path = path + ".obs"
+        if not os.path.isfile(obs_path):
+            messagebox.showerror(
+                "Файл не найден",
+                f"Рядом с выбранным файлом не найден RINEX OBS:\n\n"
+                f"{obs_path}\n\n"
+                f"Сконвертируйте .cnb в RINEX с помощью утилиты производителя "
+                f"(CnbConverter / NovAtel Convert) — должен появиться файл "
+                f"с именем «{os.path.basename(path)}.obs» в той же папке."
+            )
+            return
+
         self.cnb_file = path
         self.file_label.configure(text=os.path.basename(path))
         self.analyze_button.configure(state=tk.NORMAL)
