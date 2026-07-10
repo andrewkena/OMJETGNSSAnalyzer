@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -17,14 +18,24 @@ QUALITY_STYLE = {
 
 # label -> tile URL (XYZ, EPSG:3857)
 BASEMAPS = {
-    "Спутник Google":  "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-    "Гибрид Google":   "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
-    "Дороги Google":   "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
-    "OpenStreetMap":   "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    "Без подложки":    None,
+    "Satellite Google":  "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+    "Hybrid Google":     "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+    "Roads Google":      "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
+    "OpenStreetMap":     "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "No basemap":        None,
 }
-BASEMAP_KEYS = list(BASEMAPS.keys())
-DEFAULT_BASEMAP = "Спутник Google"
+
+# Human-readable labels (same order)
+BASEMAP_LABELS = [
+    "Satellite Google",
+    "Hybrid Google",
+    "Roads Google",
+    "OpenStreetMap",
+    "No basemap",
+]
+
+BASEMAP_KEYS = BASEMAP_LABELS
+DEFAULT_BASEMAP = "Satellite Google"
 
 _WGS84_TO_WEB = None
 
@@ -57,7 +68,7 @@ class MissionTrajectoryPlot:
             t = _transformer()
             mx, my = t.transform(lons, lats)
 
-            ax.plot(mx, my, "-", color="cyan", linewidth=1.5, label="Трек", zorder=3)
+            ax.plot(mx, my, "-", color="cyan", linewidth=1.5, label="Track", zorder=3)
 
             for quality, style in QUALITY_STYLE.items():
                 pts = [p for p in self.photo_points if p.get("quality") == quality]
@@ -65,24 +76,24 @@ class MissionTrajectoryPlot:
                     continue
                 px, py = t.transform([p["lon"] for p in pts], [p["lat"] for p in pts])
                 ax.scatter(px, py, marker=style["marker"], color=style["color"],
-                           s=style["size"], zorder=4, label=f"Фото: {quality}")
+                           s=style["size"], zorder=4, label=f"Photo: {quality}")
 
             sx, sy = t.transform([lons[0]], [lats[0]])
             ex, ey = t.transform([lons[-1]], [lats[-1]])
-            ax.plot(sx, sy, "^", color="lime", markersize=10, zorder=5, label="Старт")
-            ax.plot(ex, ey, "s", color="red",  markersize=10, zorder=5, label="Финиш")
+            ax.plot(sx, sy, "^", color="lime", markersize=10, zorder=5, label="Start")
+            ax.plot(ex, ey, "s", color="red",  markersize=10, zorder=5, label="End")
 
             try:
                 ctx.add_basemap(ax, source=tile_url, zoom="auto", attribution=False)
             except Exception as e:
                 ax.set_facecolor("#1a1a2e")
-                ax.text(0.5, 0.5, f"Тайлы недоступны:\n{e}",
+                ax.text(0.5, 0.5, f"Tiles unavailable:\n{e}",
                         transform=ax.transAxes, ha="center", va="center",
                         color="white", fontsize=8)
 
             ax.set_axis_off()
         else:
-            ax.plot(lons, lats, "-", color="tab:blue", linewidth=1, label="Трек")
+            ax.plot(lons, lats, "-", color="tab:blue", linewidth=1, label="Track")
 
             for quality, style in QUALITY_STYLE.items():
                 pts = [p for p in self.photo_points if p.get("quality") == quality]
@@ -90,16 +101,16 @@ class MissionTrajectoryPlot:
                     continue
                 ax.scatter([p["lon"] for p in pts], [p["lat"] for p in pts],
                            marker=style["marker"], color=style["color"],
-                           s=style["size"], zorder=3, label=f"Фото: {quality}")
+                           s=style["size"], zorder=3, label=f"Photo: {quality}")
 
-            ax.plot(lons[0], lats[0], "^", color="darkgreen", markersize=10, label="Старт")
-            ax.plot(lons[-1], lats[-1], "s", color="darkred",  markersize=10, label="Финиш")
-            ax.set_xlabel("Долгота")
-            ax.set_ylabel("Широта")
+            ax.plot(lons[0], lats[0], "^", color="darkgreen", markersize=10, label="Start")
+            ax.plot(lons[-1], lats[-1], "s", color="darkred",  markersize=10, label="End")
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
             ax.axis("equal")
             ax.grid(True)
 
-        ax.set_title(f"Траектория миссии  [{self.basemap}]")
+        ax.set_title(f"Mission trajectory  [{self.basemap}]")
         ax.legend(fontsize=8, loc="upper left")
         plt.tight_layout()
 
