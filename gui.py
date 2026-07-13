@@ -14,7 +14,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 from PIL import Image, ImageTk
 
 from core.pipeline import run_pipeline
-from plots.mission_trajectory_plot import BASEMAP_KEYS, DEFAULT_BASEMAP
+from plots.map_widget import MapWidget, BASEMAP_KEYS, DEFAULT_BASEMAP
 
 APP_VERSION = "0.2_10.07.2026"
 APP_AUTHOR = "andrewkena"
@@ -242,18 +242,20 @@ class GnssAnalyzerApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"OMJET GNSS Analyzer v{APP_VERSION}")
-        self.root.geometry("1000x1000")
+        self.root.geometry("1900x1000")
 
         self.cnb_file = None
         self.result = None
         self.plot_images = []
         self.overview_photo = None
-        self._trajectory_pil_image = None
-        self._map_canvas = None
-        self._map_zoom = 1.0
-        self._map_offset_x = 0.0
-        self._map_offset_y = 0.0
-        self._map_drag_prev = None
+        self._map_widget = None
+        self._geomarks_tree = None
+        self._geomarks_count_label = None
+        self._height_filter_var = None
+        self._height_pct_var = None
+        self._excluded_ids = set()
+        self._geomarks_iid_map = {}
+        self._tree_hovered_item = None
         self.dark_mode = tk.BooleanVar(value=_windows_dark_mode())
         self._basemap_var = tk.StringVar(value=DEFAULT_BASEMAP)
         self._text_widgets = []
@@ -264,6 +266,7 @@ class GnssAnalyzerApp:
         self.style.theme_use("clam")
 
         self._set_window_icon()
+        self.root.after(100, self._apply_titlebar_theme)
         self._build_top_bar()
         self._build_progress_bar()
         self._build_status_bar()
@@ -311,6 +314,24 @@ class GnssAnalyzerApp:
             except tk.TclError:
                 pass
 
+    def _apply_titlebar_theme(self, window=None):
+        """Apply dark/light title bar via Windows DWM API."""
+        if window is None:
+            window = self.root
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+            dark = 1 if self.dark_mode.get() else 0
+            # DWMWA_USE_IMMERSIVE_DARK_MODE = 20 (Windows 11), 19 (Windows 10)
+            for attr in (20, 19):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attr,
+                    ctypes.byref(ctypes.c_int(dark)),
+                    ctypes.sizeof(ctypes.c_int)
+                )
+        except Exception:
+            pass
+
     def _build_logo_bar(self):
         frame = ttk.Frame(self.root, padding=(8, 8, 8, 0))
         frame.pack(side=tk.TOP, fill=tk.X)
@@ -349,13 +370,7 @@ class GnssAnalyzerApp:
             command=self._apply_theme
         ).pack(side=tk.RIGHT, padx=10)
 
-        self.analyze_button = ttk.Button(
-            bar,
-            text="Анализировать",
-            command=self.run_analysis,
-            state=tk.DISABLED
-        )
-        self.analyze_button.pack(side=tk.RIGHT)
+        self._last_dir = None
 
     def _build_progress_bar(self):
         frame = ttk.Frame(self.root, padding=(8, 0))
@@ -383,6 +398,7 @@ class GnssAnalyzerApp:
         status.pack(side=tk.BOTTOM, fill=tk.X)
 
     def _apply_theme(self):
+        self._apply_titlebar_theme()
         theme = DARK_THEME if self.dark_mode.get() else LIGHT_THEME
 
         self.root.configure(bg=theme["bg"])
@@ -418,14 +434,25 @@ class GnssAnalyzerApp:
             canvas.configure(background=theme["bg"], highlightbackground=theme["bg"])
 
     def _build_main_area(self):
-        self.main_paned = ttk.PanedWindow(self.root, orient=tk.VERTICAL)
-        self.main_paned.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+        # Outer horizontal split: left (tabs+map) | right (geomarks table)
+        outer_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        outer_pane.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        # Left side: vertical split tabs on top, map below
+        left_frame = ttk.Frame(outer_pane)
+        outer_pane.add(left_frame, weight=3)
+
+        self.main_paned = ttk.PanedWindow(left_frame, orient=tk.VERTICAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True)
 
         self.notebook = ttk.Notebook(self.main_paned)
-        self.main_paned.add(self.notebook, weight=3)
+        self.main_paned.add(self.notebook, weight=2)
 
-        self.trajectory_panel, self.overview_image_label = self._build_trajectory_panel()
-        self.main_paned.add(self.trajectory_panel, weight=2)
+        self.trajectory_panel, self.overview_image_label = self._build_map_panel()
+        self.main_paned.add(self.trajectory_panel, weight=3)
+
+        # Right side: geomarks table full height
+        self._build_geomarks_panel(outer_pane)
 
         self.tab_overview_left, self.tab_overview_right = self._make_overview_tab("Обзор миссии")
         self.tab_satellites = self._make_text_tab("Спутники")
@@ -464,8 +491,7 @@ class GnssAnalyzerApp:
         except tk.TclError:
             pass
 
-    def _build_trajectory_panel(self):
-        # Lives outside the Notebook so it stays visible no matter which tab is selected.
+    def _build_map_panel(self):
         frame = ttk.Frame(self.main_paned, padding=(0, 4, 0, 0))
 
         header = ttk.Frame(frame)
@@ -488,23 +514,90 @@ class GnssAnalyzerApp:
         basemap_cb.pack(side=tk.LEFT, padx=(4, 0))
         basemap_cb.bind("<<ComboboxSelected>>", self._on_basemap_changed)
 
-        canvas = tk.Canvas(frame, bg="#222", highlightthickness=0)
-        canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(4, 0))
+        self._map_widget = MapWidget(frame, basemap=self._basemap_var.get())
+        self._map_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(4, 0))
 
-        canvas.bind("<Configure>", self._on_map_configure)
-        canvas.bind("<ButtonPress-1>", self._on_map_drag_start)
-        canvas.bind("<B1-Motion>", self._on_map_drag)
-        canvas.bind("<MouseWheel>", self._on_map_scroll)        # Windows
-        canvas.bind("<Button-4>", self._on_map_scroll)          # Linux scroll up
-        canvas.bind("<Button-5>", self._on_map_scroll)          # Linux scroll down
+        return frame, self._map_widget
 
-        self._map_canvas = canvas
-        self._map_zoom = 1.0
-        self._map_offset_x = 0.0
-        self._map_offset_y = 0.0
-        self._map_drag_prev = None
+    def _build_geomarks_panel(self, parent_pane):
+        frame = ttk.Frame(parent_pane, padding=(4, 4, 0, 0))
+        parent_pane.add(frame, weight=1)
 
-        return frame, canvas
+        # header row: title + counts + filter controls
+        header = ttk.Frame(frame)
+        header.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+
+        ttk.Label(
+            header,
+            text="Геометки",
+            font=("Segoe UI", 11, "bold")
+        ).pack(side=tk.LEFT)
+
+        self._geomarks_count_label = ttk.Label(header, text="", font=("Segoe UI", 9))
+        self._geomarks_count_label.pack(side=tk.LEFT, padx=(6, 0))
+
+        # right side controls
+        self._height_filter_var = tk.BooleanVar(value=True)
+        self._height_pct_var = tk.StringVar(value="10")
+
+        ttk.Combobox(
+            header,
+            textvariable=self._height_pct_var,
+            values=["5", "10", "15", "20", "25", "30"],
+            state="readonly",
+            width=4,
+        ).pack(side=tk.RIGHT, padx=(0, 2))
+        ttk.Label(header, text="% от ср. высоты").pack(side=tk.RIGHT)
+        ttk.Checkbutton(
+            header,
+            text="Фильтр по высоте",
+            variable=self._height_filter_var,
+            command=self._on_height_filter_changed,
+        ).pack(side=tk.RIGHT, padx=(0, 8))
+
+        self._height_pct_var.trace_add("write", lambda *_: self._on_height_filter_changed())
+
+        cols = ("!", "№", "Время", "Широта", "Долгота", "Высота, м", "Спутники", "Качество")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
+        col_widths = (28, 40, 130, 105, 105, 85, 75, 75)
+        for col, w in zip(cols, col_widths):
+            tree.heading(col, text=col)
+            tree.column(col, width=w, anchor=tk.CENTER, stretch=(col != "!"))
+        tree.column("!", stretch=False)
+
+        tree.tag_configure("GOOD",      background="#1a3a1a", foreground="#88ff88")
+        tree.tag_configure("NORMAL",    background="#3a3a1a", foreground="#ffee88")
+        tree.tag_configure("LOW",       background="#3a1a1a", foreground="#ff8888")
+        tree.tag_configure("FILTERED",  background="#3a0000", foreground="#ff4444")
+        tree.tag_configure("EXCLUDED",  background="#2a2a2a", foreground="#666666")
+        tree.tag_configure("HOVERED",   background="#1a3a5a", foreground="#ffffff")
+
+        # context menu
+        menu = tk.Menu(tree, tearoff=0)
+        menu.add_command(label="Исключить из вывода", command=lambda: self._exclude_selected())
+        menu.add_command(label="Восстановить",        command=lambda: self._restore_selected())
+
+        def _show_menu(event):
+            item = tree.identify_row(event.y)
+            if item and item not in tree.selection():
+                tree.selection_set(item)
+            if tree.selection():
+                menu.tk_popup(event.x_root, event.y_root)
+
+        tree.bind("<Button-3>", _show_menu)
+        tree.bind("<Motion>",  self._on_tree_hover)
+        tree.bind("<Leave>",   lambda _e: self._on_tree_leave())
+
+        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._geomarks_tree = tree
+        self._excluded_ids = set()  # photo_id excluded manually
+
+        if self._map_widget:
+            self._map_widget.set_hover_callback(self._on_map_hover)
 
     def _make_overview_tab(self, title):
         frame = ttk.Frame(self.notebook)
@@ -626,19 +719,16 @@ class GnssAnalyzerApp:
     def choose_file(self):
         path = filedialog.askopenfilename(
             title="Выберите CNB файл",
+            initialdir=self._last_dir,
             filetypes=[("CNB файлы", "*.cnb"), ("Все файлы", "*.*")]
         )
         if not path:
             return
 
+        self._last_dir = os.path.dirname(path)
+
         obs_path = path + ".obs"
-        obs_missing = not os.path.isfile(obs_path)
-
-        self.cnb_file = path
-        self.file_label.configure(text=os.path.basename(path))
-
-        if obs_missing:
-            self.analyze_button.configure(state=tk.DISABLED)
+        if not os.path.isfile(obs_path):
             self.status_var.set(
                 f"⚠ Не найден {os.path.basename(obs_path)} — конвертируйте .cnb в RINEX OBS"
             )
@@ -651,15 +741,17 @@ class GnssAnalyzerApp:
                 f"«{os.path.basename(obs_path)}» и лежать в той же папке.\n\n"
                 f"После появления файла выберите .cnb снова."
             )
-        else:
-            self.analyze_button.configure(state=tk.NORMAL)
-            self.status_var.set(f"Выбран файл: {path}")
+            return
+
+        self.cnb_file = path
+        self.file_label.configure(text=os.path.basename(path))
+        self.status_var.set(f"Выбран файл: {path}")
+        self.run_analysis()
 
     def run_analysis(self):
         if not self.cnb_file:
             return
 
-        self.analyze_button.configure(state=tk.DISABLED)
         self.progress_var.set(0)
         self.status_var.set("Анализ выполняется...")
 
@@ -700,39 +792,8 @@ class GnssAnalyzerApp:
         self.root.after(100, self._poll_queue)
 
     def _on_basemap_changed(self, _event=None):
-        if self.result is None:
-            return
-        basemap = self._basemap_var.get()
-        trajectory_png = self.result["plots"].get("trajectory")
-        if not trajectory_png:
-            return
-
-        from plots.mission_trajectory_plot import MissionTrajectoryPlot
-        traj = self.result["trajectory"]
-        photo_report = self.result["photo_report"]
-        traj_pts = traj["points"]
-        matched_fixes = self.result.get("matched_fixes", [])
-        photo_points = [
-            {**fix, "quality": photo_report[i]["quality"]}
-            for i, fix in enumerate(matched_fixes)
-        ]
-
-        def _rebuild():
-            try:
-                MissionTrajectoryPlot(traj_pts, photo_points, trajectory_png, basemap=basemap).show()
-                img = Image.open(trajectory_png)
-                self.root.after(0, lambda: self._set_trajectory_image(img))
-            except Exception as e:
-                self.root.after(0, lambda: self.status_var.set(f"Ошибка подложки: {e}"))
-
-        threading.Thread(target=_rebuild, daemon=True).start()
-
-    def _set_trajectory_image(self, img):
-        self._trajectory_pil_image = img
-        self._map_zoom = 1.0
-        self._map_offset_x = 0.0
-        self._map_offset_y = 0.0
-        self._map_redraw()
+        if self._map_widget:
+            self._map_widget.set_basemap(self._basemap_var.get())
 
     def _run_analysis_worker(self):
         try:
@@ -750,15 +811,14 @@ class GnssAnalyzerApp:
 
     def _on_analysis_error(self, exc, error_text):
         self.status_var.set("Ошибка анализа")
-        self.analyze_button.configure(state=tk.NORMAL)
         messagebox.showerror("Ошибка анализа", f"{exc}\n\n{error_text}")
 
     def _on_analysis_done(self, result):
         self.result = result
-        self.analyze_button.configure(state=tk.NORMAL)
         self.status_var.set("Анализ завершён")
 
         self._fill_overview(result)
+        self._fill_geomarks(result)
         self._fill_satellites(result)
         self._fill_photo_quality(result)
         self._fill_report(result)
@@ -855,73 +915,184 @@ class GnssAnalyzerApp:
         self._render_lines(self.tab_overview_left, left_lines)
         self._render_lines(self.tab_overview_right, right_lines)
 
-        trajectory_png = result["plots"].get("trajectory")
-        if trajectory_png and os.path.exists(trajectory_png):
-            self._trajectory_pil_image = Image.open(trajectory_png)
+        if self._map_widget:
+            traj = result["trajectory"]
+            photo_report = result["photo_report"]
+            matched_fixes = result.get("matched_fixes", [])
+            photo_points = [
+                {**fix,
+                 "quality": photo_report[i]["quality"],
+                 "height": photo_report[i].get("height"),
+                 "photo_id": photo_report[i]["photo_id"]}
+                for i, fix in enumerate(matched_fixes)
+            ]
+            self._map_widget.set_data(
+                traj["points"], photo_points,
+                height_filter=bool(self._height_filter_var and self._height_filter_var.get()),
+                height_pct=self._get_height_threshold_pct(),
+                excluded_ids=self._excluded_ids,
+            )
+
+    def _get_height_threshold_pct(self):
+        try:
+            return float(self._height_pct_var.get()) / 100.0 if self._height_pct_var else 0.10
+        except (ValueError, AttributeError):
+            return 0.10
+
+    def _exclude_selected(self):
+        if not self._geomarks_tree:
+            return
+        for item in self._geomarks_tree.selection():
+            vals = self._geomarks_tree.item(item, "values")
+            try:
+                self._excluded_ids.add(int(vals[1]))
+            except (IndexError, ValueError):
+                pass
+        self._refresh_after_exclusion()
+
+    def _restore_selected(self):
+        if not self._geomarks_tree:
+            return
+        for item in self._geomarks_tree.selection():
+            vals = self._geomarks_tree.item(item, "values")
+            try:
+                self._excluded_ids.discard(int(vals[1]))
+            except (IndexError, ValueError):
+                pass
+        self._refresh_after_exclusion()
+
+    def _refresh_after_exclusion(self):
+        if not self.result:
+            return
+        self._fill_geomarks(self.result)
+        self._rewrite_csv(self.result)
+        if self._map_widget:
+            self._map_widget.update_filter(
+                height_filter=bool(self._height_filter_var and self._height_filter_var.get()),
+                height_pct=self._get_height_threshold_pct(),
+                excluded_ids=self._excluded_ids,
+            )
+
+    def _on_height_filter_changed(self):
+        if self.result:
+            self._fill_geomarks(self.result)
+            self._rewrite_csv(self.result)
+            if self._map_widget:
+                self._map_widget.update_filter(
+                    height_filter=bool(self._height_filter_var and self._height_filter_var.get()),
+                    height_pct=self._get_height_threshold_pct(),
+                    excluded_ids=self._excluded_ids,
+                )
+
+    def _fill_geomarks(self, result):
+        if self._geomarks_tree is None:
+            return
+        tree = self._geomarks_tree
+        tree.delete(*tree.get_children())
+        self._geomarks_iid_map = {}
+        self._tree_hovered_item = None
+
+        report = result["photo_report"]
+        heights = [r["height"] for r in report if r.get("height") is not None]
+        pct = self._get_height_threshold_pct()
+
+        if heights:
+            avg_h = sum(heights) / len(heights)
+            threshold = avg_h * pct
         else:
-            self._trajectory_pil_image = None
-            if self._map_canvas:
-                self._map_canvas.delete("all")
+            avg_h = None
+            threshold = None
 
-        self._map_zoom = 1.0
-        self._map_offset_x = 0.0
-        self._map_offset_y = 0.0
-        self._map_redraw()
+        total = len(report)
+        filtered_count = 0
+        excluded_count = 0
 
-    def _on_map_configure(self, event):
-        self._map_redraw()
+        for r in report:
+            lat = f"{r['lat']:.7f}" if r.get("lat") is not None else "—"
+            lon = f"{r['lon']:.7f}" if r.get("lon") is not None else "—"
+            height = f"{r['height']:.1f}" if r.get("height") is not None else "—"
+            time_str = r["time"].strftime("%H:%M:%S.%f")[:-3] if hasattr(r["time"], "strftime") else str(r["time"])
+            quality = r["quality"]
+            photo_id = r["photo_id"]
 
-    def _on_map_drag_start(self, event):
-        self._map_drag_prev = (event.x, event.y)
+            manually_excluded = photo_id in self._excluded_ids
+            height_filtered = (
+                self._height_filter_var and self._height_filter_var.get()
+                and avg_h is not None
+                and r.get("height") is not None
+                and abs(r["height"] - avg_h) > threshold
+            )
 
-    def _on_map_drag(self, event):
-        if self._map_drag_prev is None:
+            if manually_excluded:
+                excluded_count += 1
+                indicator = "⬛"
+                tags = ("EXCLUDED",)
+            elif height_filtered:
+                filtered_count += 1
+                indicator = "🔴"
+                tags = ("FILTERED",)
+            else:
+                indicator = ""
+                tags = (quality,)
+
+            iid = tree.insert("", tk.END, values=(
+                indicator, photo_id, time_str, lat, lon, height, r["satellites"], quality
+            ), tags=tags)
+            self._geomarks_iid_map[photo_id] = iid
+
+        if self._geomarks_count_label:
+            kept = total - filtered_count - excluded_count
+            self._geomarks_count_label.configure(
+                text=f"(всего: {total},  в диапазоне: {kept},  отфильтровано: {filtered_count},  исключено: {excluded_count})"
+            )
+
+    # ── hover highlight: table ↔ map ─────────────────────────────────────────
+
+    def _on_tree_hover(self, event):
+        if not self._geomarks_tree:
             return
-        dx = event.x - self._map_drag_prev[0]
-        dy = event.y - self._map_drag_prev[1]
-        self._map_offset_x += dx
-        self._map_offset_y += dy
-        self._map_drag_prev = (event.x, event.y)
-        self._map_redraw()
-
-    def _on_map_scroll(self, event):
-        if event.num == 4:
-            delta = 1
-        elif event.num == 5:
-            delta = -1
+        item = self._geomarks_tree.identify_row(event.y)
+        if item:
+            vals = self._geomarks_tree.item(item, "values")
+            if vals:
+                try:
+                    photo_id = int(vals[1])
+                except (ValueError, IndexError):
+                    photo_id = None
+                if photo_id is not None and self._map_widget:
+                    self._map_widget.highlight_point(photo_id)
+            self._set_tree_hover(item)
         else:
-            delta = 1 if event.delta > 0 else -1
+            if self._map_widget:
+                self._map_widget.highlight_point(None)
+            self._set_tree_hover(None)
 
-        factor = 1.15 if delta > 0 else 1 / 1.15
-        cx, cy = event.x, event.y
-        self._map_offset_x = cx + (self._map_offset_x - cx) * factor
-        self._map_offset_y = cy + (self._map_offset_y - cy) * factor
-        self._map_zoom *= factor
-        self._map_redraw()
+    def _on_tree_leave(self):
+        self._set_tree_hover(None)
+        if self._map_widget:
+            self._map_widget.highlight_point(None)
 
-    def _map_redraw(self):
-        if self._map_canvas is None or self._trajectory_pil_image is None:
+    def _on_map_hover(self, photo_id):
+        if not self._geomarks_tree:
             return
-        canvas = self._map_canvas
-        cw = canvas.winfo_width()
-        ch = canvas.winfo_height()
-        if cw < 2 or ch < 2:
-            return
+        item = self._geomarks_iid_map.get(photo_id) if photo_id is not None else None
+        self._set_tree_hover(item)
+        if item:
+            self._geomarks_tree.see(item)
 
-        src = self._trajectory_pil_image
-        base_w = cw
-        base_h = int(src.height * cw / src.width)
-
-        w = max(int(base_w * self._map_zoom), 1)
-        h = max(int(base_h * self._map_zoom), 1)
-
-        resized = src.resize((w, h), Image.LANCZOS)
-        self.overview_photo = ImageTk.PhotoImage(resized)
-
-        canvas.delete("all")
-        x = int(self._map_offset_x)
-        y = int(self._map_offset_y)
-        canvas.create_image(x, y, anchor=tk.NW, image=self.overview_photo)
+    def _set_tree_hover(self, new_item):
+        old_item = self._tree_hovered_item
+        if old_item and old_item != new_item:
+            tags = list(self._geomarks_tree.item(old_item, "tags"))
+            if "HOVERED" in tags:
+                tags.remove("HOVERED")
+            self._geomarks_tree.item(old_item, tags=tags)
+        if new_item and new_item != old_item:
+            tags = list(self._geomarks_tree.item(new_item, "tags"))
+            if "HOVERED" not in tags:
+                tags.append("HOVERED")
+            self._geomarks_tree.item(new_item, tags=tags)
+        self._tree_hovered_item = new_item
 
     def _fill_satellites(self, result):
         sat = result["sat_result"]
@@ -1125,7 +1296,7 @@ class GnssAnalyzerApp:
         if not heights:
             return ""
         avg_h = sum(heights) / len(heights)
-        threshold = avg_h * 0.10
+        threshold = avg_h * self._get_height_threshold_pct()
         count = sum(1 for r in report
                     if r.get("height") is not None and abs(r["height"] - avg_h) <= threshold)
         return f"  (отфильтровано: {count})"
@@ -1135,17 +1306,23 @@ class GnssAnalyzerApp:
         report = result["photo_report"]
         csv_path = result["files"]["csv"]
 
-        if self._filter_height_var.get():
-            heights = [r.get("height") for r in report if r.get("height") is not None]
-            if heights:
-                avg_h = sum(heights) / len(heights)
-                threshold = avg_h * 0.10
-                rows = [r for r in report if r.get("height") is None
-                        or abs(r["height"] - avg_h) <= threshold]
-            else:
-                rows = report
+        heights = [r.get("height") for r in report if r.get("height") is not None]
+        use_height_filter = self._height_filter_var and self._height_filter_var.get()
+        if use_height_filter and heights:
+            avg_h = sum(heights) / len(heights)
+            threshold = avg_h * self._get_height_threshold_pct()
         else:
-            rows = report
+            avg_h = None
+            threshold = None
+
+        rows = []
+        for r in report:
+            if r["photo_id"] in self._excluded_ids:
+                continue
+            if avg_h is not None and r.get("height") is not None:
+                if abs(r["height"] - avg_h) > threshold:
+                    continue
+            rows.append(r)
 
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = _csv.writer(f)

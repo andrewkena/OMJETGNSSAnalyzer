@@ -254,7 +254,7 @@ def run_pipeline(cnb_file, progress_callback=None, basemap=None):
 
     _report(progress_callback, 91, "Построение траектории с метками фото...")
     photo_points = [
-        {**fix, "quality": report[i]["quality"]}
+        {**fix, "quality": report[i]["quality"], "height": report[i].get("height")}
         for i, fix in enumerate(matched_fixes)
     ]
 
