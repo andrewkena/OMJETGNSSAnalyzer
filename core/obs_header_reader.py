@@ -1,3 +1,5 @@
+from core.obs_file import open_obs
+
 SYSTEM_NAMES = {
     "G": "GPS",
     "R": "GLONASS",
@@ -17,7 +19,7 @@ def read_obs_signal_types(obs_file):
     types_by_system = {}
     current_system = None
 
-    with open(obs_file, "r", encoding="utf-8", errors="ignore") as f:
+    with open_obs(obs_file) as f:
         for line in f:
             label = line[60:].strip()
 

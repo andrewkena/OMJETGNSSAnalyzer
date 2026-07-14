@@ -16,7 +16,7 @@ from PIL import Image, ImageTk
 from core.pipeline import run_pipeline
 from plots.map_widget import MapWidget, BASEMAP_KEYS, DEFAULT_BASEMAP
 
-APP_VERSION = "0.2_10.07.2026"
+APP_VERSION = "0.25_14.07.2026"
 APP_AUTHOR = "andrewkena"
 
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -728,7 +728,8 @@ class GnssAnalyzerApp:
         self._last_dir = os.path.dirname(path)
 
         obs_path = path + ".obs"
-        if not os.path.isfile(obs_path):
+        obs_path_gz = path + ".obs.gz"
+        if not os.path.isfile(obs_path) and not os.path.isfile(obs_path_gz):
             self.status_var.set(
                 f"⚠ Не найден {os.path.basename(obs_path)} — конвертируйте .cnb в RINEX OBS"
             )
@@ -738,7 +739,8 @@ class GnssAnalyzerApp:
                 f"{obs_path}\n\n"
                 f"Сконвертируйте .cnb с помощью утилиты производителя "
                 f"(CnbConverter / NovAtel Convert). Файл должен называться\n"
-                f"«{os.path.basename(obs_path)}» и лежать в той же папке.\n\n"
+                f"«{os.path.basename(obs_path)}» или «{os.path.basename(obs_path_gz)}» "
+                f"и лежать в той же папке.\n\n"
                 f"После появления файла выберите .cnb снова."
             )
             return

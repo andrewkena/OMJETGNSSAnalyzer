@@ -19,6 +19,7 @@ from core.novatel.bestpos import decode_bestposb, pos_type_label
 from core.novatel.gps_ephemeris import gps_time_to_datetime, decode_rawephem
 from core.pdop import compute_pdop_series
 from core.obs_header_reader import read_obs_signal_types, system_name
+from core.obs_file import find_obs_file
 
 from plots.satellites_plot import SatellitesPlot
 from plots.timemark_interval_plot import TimemarkIntervalPlot
@@ -169,7 +170,7 @@ def _pdop_summary(pdop_series):
 
 
 def run_pipeline(cnb_file, progress_callback=None, basemap=None):
-    obs_file = cnb_file + ".obs"
+    obs_file = find_obs_file(cnb_file)
 
     runner = ProjectRunner(cnb_file)
     runner.prepare_folders()

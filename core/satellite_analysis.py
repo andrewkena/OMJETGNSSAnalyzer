@@ -1,6 +1,7 @@
 from collections import defaultdict
 import numpy as np
 from datetime import datetime
+from core.obs_file import open_obs
 
 
 class SatelliteAnalysis:
@@ -22,12 +23,7 @@ class SatelliteAnalysis:
 
         current_satellites = []
 
-        with open(
-                self.obs_file,
-                "r",
-                encoding="utf-8",
-                errors="ignore"
-        ) as f:
+        with open_obs(self.obs_file) as f:
 
             for line in f:
 

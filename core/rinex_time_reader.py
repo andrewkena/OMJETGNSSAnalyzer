@@ -1,4 +1,5 @@
 import numpy as np
+from core.obs_file import open_obs
 
 
 class RinexTimeReader:
@@ -10,12 +11,7 @@ class RinexTimeReader:
 
         times = []
 
-        with open(
-            self.filename,
-            "r",
-            encoding="utf-8",
-            errors="ignore"
-        ) as f:
+        with open_obs(self.filename) as f:
 
             for line in f:
 
