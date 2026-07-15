@@ -15,14 +15,25 @@ from PIL import Image, ImageTk
 
 from core.pipeline import run_pipeline
 from plots.map_widget import MapWidget, BASEMAP_KEYS, DEFAULT_BASEMAP
+from plots.height_profile_widget import HeightProfileWidget
 
-APP_VERSION = "0.25_14.07.2026"
+APP_VERSION = "0.26_15.07.2026"
 APP_AUTHOR = "andrewkena"
 
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 ASSETS_DIR = os.path.join(BASE_DIR, "assets")
 LOGO_PATH = os.path.join(ASSETS_DIR, "logo.png")
 ICON_PATH = os.path.join(ASSETS_DIR, "GNSS_logo.ico")
+DONE_WAV  = os.path.join(ASSETS_DIR, "done.wav")
+
+
+def _play_done():
+    try:
+        import winsound
+        if os.path.isfile(DONE_WAV):
+            winsound.PlaySound(DONE_WAV, winsound.SND_FILENAME | winsound.SND_ASYNC)
+    except Exception:
+        pass
 
 LIGHT_THEME = {
     "bg": "#f0f0f0",
@@ -122,7 +133,7 @@ OMJET GNSS ANALYZER
                      позиционирования, высота, PDOP.
 2. Спутники       — статистика по спутникам, частоты по
                      группировкам, PDOP.
-3. Качество фото  — интервалы съёмки, разрывы, итоговое качество.
+3. Качество геометок  — интервалы съёмки, разрывы, итоговое качество.
 4. Итоговый отчёт — сводный отчёт по миссии.
 5. Графики        — спутники по времени, интервалы фото, гистограмма
                      интервалов, профиль высоты, PDOP по времени.
@@ -157,9 +168,9 @@ OMJET GNSS ANALYZER
 CRITERIA_TOOLTIPS = {
     "final_score": (
         "Итоговая оценка миссии — сумма баллов:\n"
-        "• Качество фото и Качество GNSS дают от 1 до 4 баллов\n"
+        "• Качество геометок и Качество GNSS дают от 1 до 4 баллов\n"
         "  (ПЛОХО=1, НОРМАЛЬНО=2, ХОРОШО=3, ОТЛИЧНО=4)\n"
-        "• Доля хороших фото: +2 балла если ≥95%, +1 если ≥90%,\n"
+        "• Доля хороших геометок: +2 балла если ≥95%, +1 если ≥90%,\n"
         "  -1 балл если <80%\n\n"
         "Итог: ОТЛИЧНО ≥8, ХОРОШО ≥6, НОРМАЛЬНО ≥4, иначе ПЛОХО."
     ),
@@ -237,6 +248,62 @@ def _windows_dark_mode():
         return False
 
 
+def _themed_messagebox(parent, title, message, dialog_type="info",
+                       dark=True, apply_tb=None):
+    """Themed replacement for tkinter.messagebox dialogs."""
+    theme = DARK_THEME if dark else LIGHT_THEME
+    result = [None]
+
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.resizable(False, False)
+    win.configure(bg=theme["bg"])
+    win.grab_set()
+
+    if os.path.exists(ICON_PATH):
+        try:
+            win.iconbitmap(ICON_PATH)
+        except Exception:
+            pass
+
+    prefix = {"info": "ℹ  ", "warning": "⚠  ", "error": "✖  ", "yesno": "❓  "}.get(dialog_type, "")
+    tk.Label(
+        win, text=prefix + message,
+        bg=theme["bg"], fg=theme["fg"],
+        font=("Segoe UI", 10), justify=tk.LEFT,
+        wraplength=440, padx=24, pady=18
+    ).pack()
+
+    btn_frame = tk.Frame(win, bg=theme["bg"])
+    btn_frame.pack(pady=(0, 14))
+
+    if dialog_type == "yesno":
+        ttk.Button(btn_frame, text="Да",
+                   command=lambda: (result.__setitem__(0, True), win.destroy())
+                   ).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btn_frame, text="Нет",
+                   command=lambda: (result.__setitem__(0, False), win.destroy())
+                   ).pack(side=tk.LEFT, padx=8)
+    else:
+        ttk.Button(btn_frame, text="OK", command=win.destroy).pack()
+
+    win.update_idletasks()
+    pw = parent.winfo_width()
+    ph = parent.winfo_height()
+    px = parent.winfo_rootx()
+    py = parent.winfo_rooty()
+    ww = win.winfo_reqwidth()
+    wh = win.winfo_reqheight()
+    win.geometry(f"+{px + (pw - ww) // 2}+{py + (ph - wh) // 2}")
+
+    if apply_tb:
+        win.after(80, lambda: apply_tb(win))
+
+    win.focus_set()
+    win.wait_window()
+    return result[0]
+
+
 class GnssAnalyzerApp:
 
     def __init__(self, root):
@@ -249,11 +316,17 @@ class GnssAnalyzerApp:
         self.plot_images = []
         self.overview_photo = None
         self._map_widget = None
+        self._height_profile = None
         self._geomarks_tree = None
         self._geomarks_count_label = None
         self._height_filter_var = None
         self._height_pct_var = None
+        self._filter_duplicates_var = None
+        self._filter_h_range_var = None
+        self._filter_h_min_var = None
+        self._filter_h_max_var = None
         self._excluded_ids = set()
+        self._filtered_ids_cache = set()
         self._geomarks_iid_map = {}
         self._tree_hovered_item = None
         self.dark_mode = tk.BooleanVar(value=_windows_dark_mode())
@@ -273,6 +346,197 @@ class GnssAnalyzerApp:
         self._build_main_area()
 
         self._apply_theme()
+        self.root.after(400,  self._check_whats_new)
+        self.root.after(2000, self._check_for_updates)
+
+    # ── what's new ───────────────────────────────────────────────────────────
+
+    _WHATS_NEW = """\
+Версия 0.26  (15.07.2026)
+══════════════════════════════════════════════════════
+
+  ✦ Контур площади съёмки
+      В окне Мультитрек вокруг каждого трека рисуется
+      контур-полоса, повторяющий форму маршрута. Площадь
+      считается по этим полосам с учётом перекрытий.
+      Чекбокс «Площадь» скрывает/показывает контур,
+      рядом — подсказка о методе расчёта.
+
+  ✦ Средняя высота по горизонтальному полёту
+      Средняя высота в разделе «Высота полёта» теперь
+      считается только по крейсерскому участку, без
+      набора высоты и снижения.
+
+  ✦ Звук завершения в Мультитреке
+      После загрузки и обработки всех треков звук
+      воспроизводится один раз.
+
+
+Версия 0.25  (14.07.2026)
+══════════════════════════════════════════════════════
+
+  ✦ Мультитрек
+      Новая кнопка на панели инструментов открывает окно
+      для сравнения нескольких CNB-файлов на одной карте.
+      Каждый трек своим цветом, режим «В одном цвете»,
+      маркеры начала/конца, легенда на карте.
+
+  ✦ Экспорт KML
+      Из окна Мультитрек треки можно сохранить в KML
+      (Google Earth, Яндекс Карты, QGIS и др.).
+
+  ✦ Статистика треков
+      В правом нижнем углу карты Мультитрека показывается
+      суммарная протяжённость маршрутов и площадь зоны
+      съёмки (га / м²) по выпуклой оболочке точек.
+
+  ✦ Поддержка .obs.gz
+      Файл наблюдений RINEX теперь принимается как в виде
+      обычного .cnb.obs, так и сжатого .cnb.obs.gz.
+
+  ✦ Двустороннее подсвечивание (карта ↔ таблица)
+      При наведении мыши на строку в таблице геометок
+      соответствующая точка подсвечивается на карте,
+      и наоборот.
+
+  ✦ Организация результатов по файлам
+      Все отчёты, графики и CSV теперь сохраняются
+      в отдельную папку с именем анализируемого файла.
+
+  ✦ Проверка обновлений
+      При каждом запуске программа проверяет наличие
+      новой версии на GitHub и предлагает скачать её.
+
+  ✦ Установщик на русском языке
+      Добавлен Setup-установщик с деинсталлятором
+      и ярлыком на рабочем столе.
+"""
+
+    @staticmethod
+    def _version_file_path():
+        appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+        return os.path.join(appdata, "OMJET_GNSS_Analyzer", "last_version.txt")
+
+    def _check_whats_new(self):
+        try:
+            vf = self._version_file_path()
+            os.makedirs(os.path.dirname(vf), exist_ok=True)
+            last = None
+            if os.path.exists(vf):
+                with open(vf, "r", encoding="utf-8") as f:
+                    last = f.read().strip()
+            if last != APP_VERSION:
+                with open(vf, "w", encoding="utf-8") as f:
+                    f.write(APP_VERSION)
+                self._show_whats_new()
+        except Exception:
+            pass
+
+    def _show_whats_new(self):
+        import tkinter.scrolledtext as scrolledtext
+        win = tk.Toplevel(self.root)
+        win.title(f"Что нового в версии {APP_VERSION}")
+        win.geometry("620x500")
+        win.resizable(False, False)
+        if os.path.exists(ICON_PATH):
+            try:
+                win.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+
+        theme = DARK_THEME if self.dark_mode.get() else LIGHT_THEME
+        win.configure(bg=theme["bg"])
+
+        txt = scrolledtext.ScrolledText(
+            win, wrap=tk.WORD, font=("Consolas", 10),
+            background=theme["text_bg"], foreground=theme["text_fg"],
+            relief=tk.FLAT, padx=16, pady=12, state=tk.NORMAL
+        )
+        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
+        txt.insert(tk.END, self._WHATS_NEW)
+        txt.configure(state=tk.DISABLED)
+
+        ttk.Button(win, text="Понятно", command=win.destroy).pack(pady=10)
+
+        win.after(100, lambda: self._apply_titlebar_theme_to(win))
+        win.grab_set()
+        win.focus_set()
+
+    def _msginfo(self, title, message, parent=None):
+        _themed_messagebox(parent or self.root, title, message, "info",
+                           self.dark_mode.get(), self._apply_titlebar_theme_to)
+
+    def _msgwarn(self, title, message, parent=None):
+        _themed_messagebox(parent or self.root, title, message, "warning",
+                           self.dark_mode.get(), self._apply_titlebar_theme_to)
+
+    def _msgerror(self, title, message, parent=None):
+        _themed_messagebox(parent or self.root, title, message, "error",
+                           self.dark_mode.get(), self._apply_titlebar_theme_to)
+
+    def _msgyesno(self, title, message, parent=None):
+        return _themed_messagebox(parent or self.root, title, message, "yesno",
+                                  self.dark_mode.get(), self._apply_titlebar_theme_to)
+
+    def _apply_titlebar_theme_to(self, window):
+        try:
+            import ctypes
+            from ctypes import c_int, sizeof
+            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+            if not hwnd:
+                hwnd = window.winfo_id()
+            dark = c_int(1 if self.dark_mode.get() else 0)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(dark), sizeof(dark))
+        except Exception:
+            pass
+
+    def _open_multitrack(self):
+        MultitrackWindow(self.root, self)
+
+    def _check_for_updates(self):
+        threading.Thread(target=self._fetch_latest_version, daemon=True).start()
+
+    def _fetch_latest_version(self):
+        import webbrowser
+        import json
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.github.com/repos/andrewkena/OMJETGNSSAnalyzer/releases/latest",
+                headers={"User-Agent": "OMJET-GNSS-Analyzer"}
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+            tag = data.get("tag_name", "").lstrip("v")
+            html_url = data.get("html_url", "")
+            if not tag or tag == APP_VERSION:
+                return
+            current = self._parse_version_date(APP_VERSION)
+            latest = self._parse_version_date(tag)
+            if latest and current and latest > current:
+                self.root.after(0, lambda: self._show_update_dialog(tag, html_url))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_version_date(version):
+        from datetime import datetime
+        try:
+            return datetime.strptime(version.split("_", 1)[1], "%d.%m.%Y").date()
+        except Exception:
+            return None
+
+    def _show_update_dialog(self, latest_tag, url):
+        import webbrowser
+        answer = self._msgyesno(
+            "Доступна новая версия",
+            f"Доступна новая версия программы:\n\n"
+            f"  Новая:    {latest_tag}\n"
+            f"  Текущая:  {APP_VERSION}\n\n"
+            f"Открыть страницу загрузки на GitHub?"
+        )
+        if answer:
+            webbrowser.open(url)
 
     def _make_help_icon(self, parent, tooltip_text, size=16, command=None):
         canvas = tk.Canvas(parent, width=size, height=size, highlightthickness=0, bd=0)
@@ -359,6 +623,12 @@ class GnssAnalyzerApp:
             text="Выбрать файл...",
             command=self.choose_file
         ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            bar,
+            text="Мультитрек",
+            command=self._open_multitrack
+        ).pack(side=tk.LEFT, padx=(6, 0))
 
         self.file_label = ttk.Label(bar, text="Файл не выбран")
         self.file_label.pack(side=tk.LEFT, padx=10)
@@ -456,7 +726,7 @@ class GnssAnalyzerApp:
 
         self.tab_overview_left, self.tab_overview_right = self._make_overview_tab("Обзор миссии")
         self.tab_satellites = self._make_text_tab("Спутники")
-        self.tab_photo = self._make_text_tab("Качество фото")
+        self.tab_photo = self._make_text_tab("Качество геометок")
         self.tab_report = self._make_text_tab("Итоговый отчёт")
         self.tab_plots = self._make_plots_tab("Графики")
         self.tab_files = self._make_files_tab("Файлы результата")
@@ -514,8 +784,28 @@ class GnssAnalyzerApp:
         basemap_cb.pack(side=tk.LEFT, padx=(4, 0))
         basemap_cb.bind("<<ComboboxSelected>>", self._on_basemap_changed)
 
-        self._map_widget = MapWidget(frame, basemap=self._basemap_var.get())
-        self._map_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(4, 0))
+        vpaned = ttk.PanedWindow(frame, orient=tk.VERTICAL)
+        vpaned.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        map_frame = ttk.Frame(vpaned)
+        vpaned.add(map_frame, weight=1)
+
+        self._map_widget = MapWidget(map_frame, basemap=self._basemap_var.get())
+        self._map_widget.pack(fill=tk.BOTH, expand=True)
+
+        dark = _windows_dark_mode()
+        self._height_profile = HeightProfileWidget(vpaned, dark=dark,
+                                                   bg="#1e1e1e" if dark else "#f0f0f0")
+        vpaned.add(self._height_profile, weight=0)
+
+        def _fix_sash():
+            total = vpaned.winfo_height()
+            if total > 200:
+                vpaned.sashpos(0, total - 60)
+            else:
+                frame.after(100, _fix_sash)
+
+        frame.after(150, _fix_sash)
 
         return frame, self._map_widget
 
@@ -523,7 +813,7 @@ class GnssAnalyzerApp:
         frame = ttk.Frame(parent_pane, padding=(4, 4, 0, 0))
         parent_pane.add(frame, weight=1)
 
-        # header row: title + counts + filter controls
+        # header row: title + counts
         header = ttk.Frame(frame)
         header.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
 
@@ -536,26 +826,59 @@ class GnssAnalyzerApp:
         self._geomarks_count_label = ttk.Label(header, text="", font=("Segoe UI", 9))
         self._geomarks_count_label.pack(side=tk.LEFT, padx=(6, 0))
 
-        # right side controls
-        self._height_filter_var = tk.BooleanVar(value=True)
+        # ── filter row 1: from average height ────────────────────────────────
+        self._height_filter_var = tk.BooleanVar(value=False)
         self._height_pct_var = tk.StringVar(value="10")
 
-        ttk.Combobox(
-            header,
-            textvariable=self._height_pct_var,
-            values=["5", "10", "15", "20", "25", "30"],
-            state="readonly",
-            width=4,
-        ).pack(side=tk.RIGHT, padx=(0, 2))
-        ttk.Label(header, text="% от ср. высоты").pack(side=tk.RIGHT)
+        f1 = ttk.Frame(frame)
+        f1.pack(side=tk.TOP, fill=tk.X, pady=(0, 1))
         ttk.Checkbutton(
-            header,
-            text="Фильтр по высоте",
+            f1, text="Фильтровать от средней высоты",
             variable=self._height_filter_var,
             command=self._on_height_filter_changed,
-        ).pack(side=tk.RIGHT, padx=(0, 8))
+        ).pack(side=tk.LEFT)
+        ttk.Entry(f1, textvariable=self._height_pct_var, width=4).pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Label(f1, text="% от ср. высоты").pack(side=tk.LEFT)
 
         self._height_pct_var.trace_add("write", lambda *_: self._on_height_filter_changed())
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X, pady=3)
+
+        # ── filter row 2: duplicates ──────────────────────────────────────────
+        self._filter_duplicates_var = tk.BooleanVar(value=False)
+
+        f2 = ttk.Frame(frame)
+        f2.pack(side=tk.TOP, fill=tk.X, pady=(0, 1))
+        ttk.Checkbutton(
+            f2, text="Фильтровать дубли",
+            variable=self._filter_duplicates_var,
+            command=self._on_height_filter_changed,
+        ).pack(side=tk.LEFT)
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X, pady=3)
+
+        # ── filter row 3: height range ────────────────────────────────────────
+        self._filter_h_range_var = tk.BooleanVar(value=False)
+        self._filter_h_min_var = tk.StringVar(value="")
+        self._filter_h_max_var = tk.StringVar(value="")
+
+        f3 = ttk.Frame(frame)
+        f3.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        ttk.Checkbutton(
+            f3, text="Фильтровать по высоте",
+            variable=self._filter_h_range_var,
+            command=self._on_height_filter_changed,
+        ).pack(side=tk.LEFT)
+        ttk.Label(f3, text="от").pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Entry(f3, textvariable=self._filter_h_min_var, width=6).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(f3, text="до").pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Entry(f3, textvariable=self._filter_h_max_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(f3, text="м").pack(side=tk.LEFT, padx=(2, 0))
+
+        self._filter_h_min_var.trace_add("write", lambda *_: self._on_height_filter_changed())
+        self._filter_h_max_var.trace_add("write", lambda *_: self._on_height_filter_changed())
+
+        ttk.Separator(frame, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X, pady=3)
 
         cols = ("!", "№", "Время", "Широта", "Долгота", "Высота, м", "Спутники", "Качество")
         tree = ttk.Treeview(frame, columns=cols, show="headings", selectmode="extended")
@@ -570,6 +893,7 @@ class GnssAnalyzerApp:
         tree.tag_configure("LOW",       background="#3a1a1a", foreground="#ff8888")
         tree.tag_configure("FILTERED",  background="#3a0000", foreground="#ff4444")
         tree.tag_configure("EXCLUDED",  background="#2a2a2a", foreground="#666666")
+        tree.tag_configure("DUPLICATE", background="#3a2500", foreground="#ffaa33")
         tree.tag_configure("HOVERED",   background="#1a3a5a", foreground="#ffffff")
 
         # context menu
@@ -717,6 +1041,17 @@ class GnssAnalyzerApp:
         widget.configure(state=tk.DISABLED)
 
     def choose_file(self):
+        self._msginfo(
+            "Подготовка к анализу",
+            "Для анализа необходимы два файла в одной папке:\n\n"
+            "  • Файл данных приёмника:  имя_файла.cnb\n"
+            "  • Файл наблюдений RINEX:  имя_файла.cnb.obs\n"
+            "                        или  имя_файла.cnb.obs.gz\n\n"
+            "Файл .obs создаётся утилитой конвертации производителя\n"
+            "(CnbConverter / NovAtel Convert) и должен лежать\n"
+            "рядом с .cnb файлом.\n\n"
+            "Обработка большого файла может занять несколько минут."
+        )
         path = filedialog.askopenfilename(
             title="Выберите CNB файл",
             initialdir=self._last_dir,
@@ -733,7 +1068,7 @@ class GnssAnalyzerApp:
             self.status_var.set(
                 f"⚠ Не найден {os.path.basename(obs_path)} — конвертируйте .cnb в RINEX OBS"
             )
-            messagebox.showwarning(
+            self._msgwarn(
                 "Отсутствует файл OBS",
                 f"Файл наблюдений RINEX OBS не найден:\n\n"
                 f"{obs_path}\n\n"
@@ -813,14 +1148,15 @@ class GnssAnalyzerApp:
 
     def _on_analysis_error(self, exc, error_text):
         self.status_var.set("Ошибка анализа")
-        messagebox.showerror("Ошибка анализа", f"{exc}\n\n{error_text}")
+        self._msgerror("Ошибка анализа", f"{exc}\n\n{error_text}")
 
     def _on_analysis_done(self, result):
         self.result = result
         self.status_var.set("Анализ завершён")
+        _play_done()
 
-        self._fill_overview(result)
         self._fill_geomarks(result)
+        self._fill_overview(result)
         self._fill_satellites(result)
         self._fill_photo_quality(result)
         self._fill_report(result)
@@ -846,23 +1182,19 @@ class GnssAnalyzerApp:
         start = str(time_result["start"]).replace("T", " ")
         end = str(time_result["end"]).replace("T", " ")
 
-        sep_left = self._fit_separator(self.tab_overview_left, "=")
         sep_right = self._fit_separator(self.tab_overview_right, "-")
 
         left_lines = [
-            "ОБЗОР МИССИИ",
-            sep_left,
-            "",
             ("quality", "Итоговая оценка    : ", mission["final_score"], "final_score"),
-            ("quality", "Качество фото      : ", mission["photo_quality"], "photo_quality"),
+            ("quality", "Качество геометок  :", mission["photo_quality"], "photo_quality"),
             ("quality", "Качество GNSS      : ", mission["gnss_quality"], "gnss_quality"),
-            f"Доля хороших фото  : {mission['good_percent']:.1f}%",
+            f"Доля хор. геометок : {mission['good_percent']:.1f}%",
             "",
             f"Время начала (UTC) : {start}",
             f"Время окончания    : {end}",
             f"Длительность полёта: {mission['flight_duration_min']:.1f} мин",
             f"Интервал записи    : {time_result['median_interval']:.3f} сек ({time_result['nominal_rate_hz']:.1f} Гц)",
-            f"Количество фото    : {mission['photo_count']}{self._filtered_photo_label(result)}",
+            f"Количество геометок: {mission['photo_count']}  (отфильтровано: {len(self._filtered_ids_cache)})",
             f"Уникальных спутников: {mission['unique_satellites']}",
         ]
 
@@ -930,10 +1262,10 @@ class GnssAnalyzerApp:
             ]
             self._map_widget.set_data(
                 traj["points"], photo_points,
-                height_filter=bool(self._height_filter_var and self._height_filter_var.get()),
-                height_pct=self._get_height_threshold_pct(),
                 excluded_ids=self._excluded_ids,
             )
+            if self._height_profile:
+                self._height_profile.set_data(traj["points"], photo_points)
 
     def _get_height_threshold_pct(self):
         try:
@@ -969,22 +1301,12 @@ class GnssAnalyzerApp:
         self._fill_geomarks(self.result)
         self._rewrite_csv(self.result)
         if self._map_widget:
-            self._map_widget.update_filter(
-                height_filter=bool(self._height_filter_var and self._height_filter_var.get()),
-                height_pct=self._get_height_threshold_pct(),
-                excluded_ids=self._excluded_ids,
-            )
+            self._map_widget.update_filter(excluded_ids=self._excluded_ids)
 
     def _on_height_filter_changed(self):
         if self.result:
             self._fill_geomarks(self.result)
             self._rewrite_csv(self.result)
-            if self._map_widget:
-                self._map_widget.update_filter(
-                    height_filter=bool(self._height_filter_var and self._height_filter_var.get()),
-                    height_pct=self._get_height_threshold_pct(),
-                    excluded_ids=self._excluded_ids,
-                )
 
     def _fill_geomarks(self, result):
         if self._geomarks_tree is None:
@@ -998,16 +1320,39 @@ class GnssAnalyzerApp:
         heights = [r["height"] for r in report if r.get("height") is not None]
         pct = self._get_height_threshold_pct()
 
-        if heights:
+        if heights and self._height_filter_var and self._height_filter_var.get():
             avg_h = sum(heights) / len(heights)
             threshold = avg_h * pct
         else:
             avg_h = None
             threshold = None
 
+        from collections import Counter
+        coord_counts = Counter(
+            (r.get("lat"), r.get("lon")) for r in report
+            if r.get("lat") is not None and r.get("lon") is not None
+        )
+        duplicate_coords = {c for c, n in coord_counts.items() if n > 1}
+
+        filter_dups = bool(self._filter_duplicates_var and self._filter_duplicates_var.get())
+        seen_coords = set()
+
+        filter_range = bool(self._filter_h_range_var and self._filter_h_range_var.get())
+        try:
+            h_min = float(self._filter_h_min_var.get()) if self._filter_h_min_var and self._filter_h_min_var.get().strip() else None
+        except ValueError:
+            h_min = None
+        try:
+            h_max = float(self._filter_h_max_var.get()) if self._filter_h_max_var and self._filter_h_max_var.get().strip() else None
+        except ValueError:
+            h_max = None
+
         total = len(report)
         filtered_count = 0
         excluded_count = 0
+        duplicate_count = 0
+        range_filtered_count = 0
+        filtered_ids = set()
 
         for r in report:
             lat = f"{r['lat']:.7f}" if r.get("lat") is not None else "—"
@@ -1019,10 +1364,20 @@ class GnssAnalyzerApp:
 
             manually_excluded = photo_id in self._excluded_ids
             height_filtered = (
-                self._height_filter_var and self._height_filter_var.get()
-                and avg_h is not None
+                avg_h is not None
                 and r.get("height") is not None
                 and abs(r["height"] - avg_h) > threshold
+            )
+            coord = (r.get("lat"), r.get("lon"))
+            is_duplicate = coord in duplicate_coords
+            dup_filtered = filter_dups and is_duplicate and coord in seen_coords
+            if is_duplicate:
+                seen_coords.add(coord)
+
+            h_val = r.get("height")
+            range_filtered = (
+                filter_range and h_val is not None
+                and ((h_min is not None and h_val < h_min) or (h_max is not None and h_val > h_max))
             )
 
             if manually_excluded:
@@ -1031,8 +1386,22 @@ class GnssAnalyzerApp:
                 tags = ("EXCLUDED",)
             elif height_filtered:
                 filtered_count += 1
+                filtered_ids.add(photo_id)
                 indicator = "🔴"
                 tags = ("FILTERED",)
+            elif dup_filtered:
+                duplicate_count += 1
+                filtered_ids.add(photo_id)
+                indicator = "🟠"
+                tags = ("FILTERED",)
+            elif range_filtered:
+                range_filtered_count += 1
+                filtered_ids.add(photo_id)
+                indicator = "🔵"
+                tags = ("FILTERED",)
+            elif is_duplicate and not filter_dups:
+                indicator = "🟠"
+                tags = ("DUPLICATE",)
             else:
                 indicator = ""
                 tags = (quality,)
@@ -1043,9 +1412,25 @@ class GnssAnalyzerApp:
             self._geomarks_iid_map[photo_id] = iid
 
         if self._geomarks_count_label:
-            kept = total - filtered_count - excluded_count
-            self._geomarks_count_label.configure(
-                text=f"(всего: {total},  в диапазоне: {kept},  отфильтровано: {filtered_count},  исключено: {excluded_count})"
+            total_filtered = filtered_count + duplicate_count + range_filtered_count + excluded_count
+            kept = total - total_filtered
+            parts = [f"всего: {total}", f"ок: {kept}"]
+            if duplicate_count:
+                parts.append(f"дубли: {duplicate_count}")
+            if filtered_count:
+                parts.append(f"ср.высота: {filtered_count}")
+            if range_filtered_count:
+                parts.append(f"диапазон: {range_filtered_count}")
+            if excluded_count:
+                parts.append(f"исключено: {excluded_count}")
+            self._geomarks_count_label.configure(text="(" + ",  ".join(parts) + ")")
+
+        self._filtered_ids_cache = filtered_ids
+
+        if self._map_widget:
+            self._map_widget.update_filter(
+                excluded_ids=self._excluded_ids,
+                filtered_ids=filtered_ids,
             )
 
     # ── hover highlight: table ↔ map ─────────────────────────────────────────
@@ -1070,11 +1455,20 @@ class GnssAnalyzerApp:
             self._set_tree_hover(None)
 
     def _on_tree_leave(self):
+        # small delay: if mouse went to map, _on_map_hover will cancel the clear
+        self._tree_leave_job = self.root.after(80, self._do_tree_leave)
+
+    def _do_tree_leave(self):
         self._set_tree_hover(None)
         if self._map_widget:
             self._map_widget.highlight_point(None)
 
     def _on_map_hover(self, photo_id):
+        # cancel pending tree-leave clear
+        job = getattr(self, "_tree_leave_job", None)
+        if job:
+            self.root.after_cancel(job)
+            self._tree_leave_job = None
         if not self._geomarks_tree:
             return
         item = self._geomarks_iid_map.get(photo_id) if photo_id is not None else None
@@ -1145,14 +1539,7 @@ class GnssAnalyzerApp:
     def _fill_photo_quality(self, result):
         quality = result["photo_quality"]
 
-        excluded = quality.get("excluded_count", 0)
-        cluster_size = quality.get("cluster_size", 0)
         lines = [
-            "КАЧЕСТВО ФОТОСЪЁМКИ",
-            "=" * 50,
-            "",
-            f"Фото в основном массиве : {cluster_size}",
-            f"Точек на удалении       : {excluded}" if excluded else "",
             f"Номинальный интервал    : {quality['median_interval']:.3f} сек",
             f"Стд. отклонение         : {quality['std_dev']:.3f} сек",
             f"95-й перцентиль         : {quality['p95']:.3f} сек",
@@ -1169,7 +1556,7 @@ class GnssAnalyzerApp:
             "ИТОГОВЫЙ ОТЧЁТ ПО МИССИИ",
             "=" * 50,
             "",
-            ("quality", "Качество фото      : ", mission["photo_quality"], "photo_quality"),
+            ("quality", "Качество геометок  :", mission["photo_quality"], "photo_quality"),
             ("quality", "Качество GNSS      : ", mission["gnss_quality"], "gnss_quality"),
             f"Хороших фото       : {mission['good_percent']:.1f}%",
             "",
@@ -1243,21 +1630,22 @@ class GnssAnalyzerApp:
         filter_frame = ttk.Frame(self.tab_files, padding=(8, 6, 8, 0))
         filter_frame.pack(side=tk.TOP, fill=tk.X)
 
-        self._filter_height_var = tk.BooleanVar(value=True)
+        self._filter_height_var = tk.BooleanVar(value=False)
 
         ttk.Checkbutton(
             filter_frame,
-            text="Отфильтровать метки по высоте",
+            text="Применить фильтрацию геометок",
             variable=self._filter_height_var,
             command=lambda: self._rewrite_csv(result),
         ).pack(side=tk.LEFT)
 
         tooltip_text = (
-            "При включении из CSV-отчёта исключаются геометки,\n"
-            "высота которых отличается от средней высоты полёта\n"
-            "более чем на 10%.\n\n"
-            "Это позволяет убрать снимки, сделанные на взлёте\n"
-            "или посадке, которые не входят в рабочий маршрут."
+            "При включении в CSV-файл попадают только те геометки,\n"
+            "которые прошли все активные фильтры в таблице:\n"
+            "  • Фильтр от средней высоты\n"
+            "  • Фильтр дублей\n"
+            "  • Фильтр по диапазону высот\n\n"
+            "Исключённые вручную метки убираются всегда."
         )
         icon = self._make_help_icon(filter_frame, tooltip_text)
         filter_frame.after(10, lambda: icon.pack(side=tk.LEFT, padx=(4, 0)))
@@ -1292,38 +1680,20 @@ class GnssAnalyzerApp:
                 command=lambda p=path: self._view_file(p)
             ).pack(side=tk.RIGHT, padx=4)
 
-    def _filtered_photo_label(self, result):
-        report = result["photo_report"]
-        heights = [r["height"] for r in report if r.get("height") is not None]
-        if not heights:
-            return ""
-        avg_h = sum(heights) / len(heights)
-        threshold = avg_h * self._get_height_threshold_pct()
-        count = sum(1 for r in report
-                    if r.get("height") is not None and abs(r["height"] - avg_h) <= threshold)
-        return f"  (отфильтровано: {count})"
-
     def _rewrite_csv(self, result):
         import csv as _csv
         report = result["photo_report"]
         csv_path = result["files"]["csv"]
 
-        heights = [r.get("height") for r in report if r.get("height") is not None]
-        use_height_filter = self._height_filter_var and self._height_filter_var.get()
-        if use_height_filter and heights:
-            avg_h = sum(heights) / len(heights)
-            threshold = avg_h * self._get_height_threshold_pct()
-        else:
-            avg_h = None
-            threshold = None
+        apply_filters = bool(self._filter_height_var and self._filter_height_var.get())
 
         rows = []
         for r in report:
-            if r["photo_id"] in self._excluded_ids:
+            pid = r["photo_id"]
+            if pid in self._excluded_ids:
                 continue
-            if avg_h is not None and r.get("height") is not None:
-                if abs(r["height"] - avg_h) > threshold:
-                    continue
+            if apply_filters and pid in self._filtered_ids_cache:
+                continue
             rows.append(r)
 
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -1341,30 +1711,30 @@ class GnssAnalyzerApp:
 
     def _open_folder(self, path):
         if not os.path.isdir(path):
-            messagebox.showerror("Ошибка", f"Папка не найдена:\n{path}")
+            self._msgerror("Ошибка", f"Папка не найдена:\n{path}")
             return
         try:
             os.startfile(path)
         except OSError as exc:
-            messagebox.showerror("Ошибка", f"Не удалось открыть папку:\n{exc}")
+            self._msgerror("Ошибка", f"Не удалось открыть папку:\n{exc}")
 
     def _view_file(self, path):
         if not os.path.exists(path):
-            messagebox.showerror("Ошибка", f"Файл не найден:\n{path}")
+            self._msgerror("Ошибка", f"Файл не найден:\n{path}")
             return
 
         if path.lower().endswith(".pdf"):
             try:
                 os.startfile(path)
             except OSError as exc:
-                messagebox.showerror("Ошибка", f"Не удалось открыть PDF:\n{exc}")
+                self._msgerror("Ошибка", f"Не удалось открыть PDF:\n{exc}")
             return
 
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
         except OSError as exc:
-            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{exc}")
+            self._msgerror("Ошибка", f"Не удалось прочитать файл:\n{exc}")
             return
 
         theme = DARK_THEME if self.dark_mode.get() else LIGHT_THEME
@@ -1379,6 +1749,278 @@ class GnssAnalyzerApp:
         text.pack(fill=tk.BOTH, expand=True)
         text.insert(tk.END, content)
         text.configure(state=tk.DISABLED)
+
+
+class MultitrackWindow:
+
+    COLORS = [
+        "#00c8ff", "#ff6b35", "#7fff00", "#ff44cc",
+        "#ffee00", "#ff9900", "#00ff9f", "#ff4466",
+        "#aa88ff", "#44ffdd",
+    ]
+    SINGLE_COLOR = "#00c8ff"
+
+    def __init__(self, parent, app):
+        self.app = app
+        self._tracks_data = []   # [{label, color, points}]
+        self.win = tk.Toplevel(parent)
+        self.win.title("Мультитрек")
+        self.win.geometry("1400x900")
+        self._track_count = 0
+        self._pending_loads = 0
+        self._last_dir = None
+        self._single_color_var = tk.BooleanVar(value=False)
+        self._hide_stats_var = tk.BooleanVar(value=False)
+        self._hull_visible_var = tk.BooleanVar(value=True)
+        self._build()
+        self._apply_theme()
+        self.win.after(100, self._apply_titlebar_theme)
+
+    def _build(self):
+        # ── top bar ──────────────────────────────────────────────────────
+        top = ttk.Frame(self.win, padding=(8, 6))
+        top.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Button(top, text="Добавить файлы", command=self._add_files).pack(side=tk.LEFT)
+        ttk.Button(top, text="Очистить", command=self._clear).pack(side=tk.LEFT, padx=(6, 0))
+
+        ttk.Label(top, text="  Подложка:").pack(side=tk.LEFT)
+        self._basemap_var = tk.StringVar(value=DEFAULT_BASEMAP)
+        cb = ttk.Combobox(
+            top, textvariable=self._basemap_var,
+            values=BASEMAP_KEYS, state="readonly", width=22
+        )
+        cb.pack(side=tk.LEFT, padx=(4, 0))
+        cb.bind("<<ComboboxSelected>>", lambda _e: self._map.set_basemap(self._basemap_var.get()))
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=(16, 0), pady=2)
+
+        ttk.Checkbutton(
+            top, text="В одном цвете",
+            variable=self._single_color_var,
+            command=self._on_color_mode_changed
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0), pady=2)
+
+        ttk.Checkbutton(
+            top, text="Скрыть статистику",
+            variable=self._hide_stats_var,
+            command=self._on_stats_toggle
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=(10, 0), pady=2)
+
+        ttk.Checkbutton(
+            top, text="Площадь",
+            variable=self._hull_visible_var,
+            command=self._on_hull_toggle
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        area_help = (
+            "Площадь съёмки\n"
+            "\n"
+            "Вокруг линии каждого трека строится буфер (полоса)\n"
+            "фиксированной ширины, повторяющий форму маршрута.\n"
+            "Соседние проходы сетки сливаются в единый контур.\n"
+            "Площадь — суммарная площадь этих полос по всем трекам\n"
+            "(перекрытия учитываются один раз).\n"
+            "\n"
+            "Ширина полосы подбирается автоматически от размера\n"
+            "трека (2% диагонали, в пределах 30–150 м)."
+        )
+        self.app._make_help_icon(top, area_help).pack(side=tk.LEFT, padx=(4, 0))
+
+        # ── map ───────────────────────────────────────────────────────────
+        self._map = MapWidget(self.win, basemap=self._basemap_var.get())
+        self._map.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 0))
+
+        # ── bottom bar ────────────────────────────────────────────────────
+        bottom = ttk.Frame(self.win, padding=(8, 4))
+        bottom.pack(side=tk.BOTTOM, fill=tk.X)
+
+        ttk.Button(bottom, text="Экспортировать KML",
+                   command=self._export_kml).pack(side=tk.LEFT)
+        ttk.Button(bottom, text="Экспортировать изображение",
+                   command=self._export_image).pack(side=tk.LEFT, padx=(8, 0))
+
+        self._status_var = tk.StringVar(value="Добавьте CNB файлы")
+        ttk.Label(self.win, textvariable=self._status_var,
+                  relief=tk.SUNKEN, anchor=tk.W, padding=4).pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _apply_theme(self):
+        theme = DARK_THEME if self.app.dark_mode.get() else LIGHT_THEME
+        self.win.configure(bg=theme["bg"])
+
+    def _apply_titlebar_theme(self):
+        self.app._apply_titlebar_theme_to(self.win)
+        if os.path.exists(ICON_PATH):
+            try:
+                self.win.iconbitmap(ICON_PATH)
+            except Exception:
+                pass
+
+    def _on_color_mode_changed(self):
+        if self._single_color_var.get():
+            self._map.set_single_color(self.SINGLE_COLOR)
+            self._map.set_legend_visible(False)
+        else:
+            self._map.set_single_color(None)
+            self._map.set_legend_visible(True)
+
+    def _on_stats_toggle(self):
+        self._map.set_stats_visible(not self._hide_stats_var.get())
+
+    def _on_hull_toggle(self):
+        self._map.set_hull_visible(self._hull_visible_var.get())
+
+    def _export_image(self):
+        from PIL import ImageGrab
+        path = filedialog.asksaveasfilename(
+            parent=self.win,
+            title="Сохранить изображение",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("JPEG", "*.jpg")],
+        )
+        if not path:
+            return
+        self.win.update_idletasks()
+        x = self._map.winfo_rootx()
+        y = self._map.winfo_rooty()
+        w = self._map.winfo_width()
+        h = self._map.winfo_height()
+        try:
+            img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
+            img.save(path)
+            self._status_var.set(f"Изображение сохранено: {os.path.basename(path)}")
+        except Exception as e:
+            self.app._msgerror("Ошибка экспорта", str(e), parent=self.win)
+
+    def _add_files(self):
+        self.app._msginfo(
+            "Загрузка файлов",
+            "При загрузке больших CNB-файлов обработка может занять некоторое время.\n\n"
+            "Программа не зависнет — дождитесь появления треков на карте.",
+            parent=self.win
+        )
+        paths = filedialog.askopenfilenames(
+            parent=self.win,
+            title="Выберите CNB файлы",
+            initialdir=self._last_dir,
+            filetypes=[("CNB файлы", "*.cnb"), ("Все файлы", "*.*")]
+        )
+        if not paths:
+            return
+        self._last_dir = os.path.dirname(paths[0])
+        for path in paths:
+            self._load_file(path)
+
+    def _load_file(self, path):
+        color = self.COLORS[self._track_count % len(self.COLORS)]
+        self._track_count += 1
+        self._pending_loads += 1
+        label = os.path.splitext(os.path.basename(path))[0]
+        self._status_var.set(f"Загрузка {label}…")
+        threading.Thread(
+            target=self._extract_and_draw,
+            args=(path, color, label),
+            daemon=True
+        ).start()
+
+    def _extract_and_draw(self, path, color, label):
+        from core.novatel.reader import iter_messages
+        from core.novatel.bestpos import decode_bestposb
+        from core.novatel.gps_ephemeris import gps_time_to_datetime
+        MSG_ID_BESTPOS = 42
+        points = []
+        try:
+            for msg in iter_messages(path):
+                if msg.msg_id != MSG_ID_BESTPOS:
+                    continue
+                fix = decode_bestposb(msg.body)
+                if fix is not None:
+                    fix["time"] = gps_time_to_datetime(msg.week, msg.tow_sec)
+                    points.append(fix)
+        except Exception as e:
+            self.win.after(0, lambda: self._on_track_failed(label, e))
+            return
+        if points:
+            self.win.after(0, lambda: self._on_track_loaded(points, color, label))
+        else:
+            self.win.after(0, lambda: self._on_track_failed(label, "нет данных"))
+
+    def _on_track_failed(self, label, err):
+        self._status_var.set(f"Ошибка {label}: {err}")
+        self._pending_loads -= 1
+        if self._pending_loads == 0:
+            _play_done()
+
+    def _on_track_loaded(self, points, color, label):
+        self._tracks_data.append({"label": label, "color": color, "points": points})
+        self._map.add_track(points, color, label)
+        self._status_var.set(f"Загружено: {label}  ({len(points)} точек)")
+        self._pending_loads -= 1
+        if self._pending_loads == 0:
+            _play_done()
+
+    @staticmethod
+    def _hex_to_kml_color(hex_color):
+        h = hex_color.lstrip("#")
+        r, g, b = h[0:2], h[2:4], h[4:6]
+        return f"ff{b}{g}{r}"
+
+    def _export_kml(self):
+        if not self._tracks_data:
+            self.app._msginfo("Экспорт KML", "Нет загруженных треков.", parent=self.win)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=self.win,
+            title="Сохранить KML",
+            defaultextension=".kml",
+            filetypes=[("KML файлы", "*.kml"), ("Все файлы", "*.*")],
+            initialfile="multitrack.kml",
+            initialdir=self._last_dir,
+        )
+        if not path:
+            return
+
+        lines = ['<?xml version="1.0" encoding="UTF-8"?>',
+                 '<kml xmlns="http://www.opengis.net/kml/2.2">',
+                 '  <Document>',
+                 '    <name>Мультитрек</name>']
+
+        for i, track in enumerate(self._tracks_data):
+            kml_color = self._hex_to_kml_color(track["color"])
+            lines.append(f'    <Style id="s{i}"><LineStyle>'
+                         f'<color>{kml_color}</color><width>3</width>'
+                         f'</LineStyle></Style>')
+
+        for i, track in enumerate(self._tracks_data):
+            coords = " ".join(
+                f"{p['lon']},{p['lat']},{p.get('height', 0):.1f}"
+                for p in track["points"]
+            )
+            lines += [
+                f'    <Placemark>',
+                f'      <name>{track["label"]}</name>',
+                f'      <styleUrl>#s{i}</styleUrl>',
+                f'      <LineString><tessellate>1</tessellate>',
+                f'        <coordinates>{coords}</coordinates>',
+                f'      </LineString>',
+                f'    </Placemark>',
+            ]
+
+        lines += ['  </Document>', '</kml>']
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        self._status_var.set(f"KML сохранён: {os.path.basename(path)}")
+
+    def _clear(self):
+        self._map.clear_tracks()
+        self._track_count = 0
+        self._tracks_data = []
+        self._status_var.set("Добавьте CNB файлы")
 
 
 def main():

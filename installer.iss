@@ -1,5 +1,5 @@
 #define AppName "OMJET GNSS Analyzer"
-#define AppVersion "0.25_14.07.2026"
+#define AppVersion "0.26_15.07.2026"
 #define AppPublisher "andrewkena"
 #define AppExeName "OMJET_GNSS_Analyzer.exe"
 

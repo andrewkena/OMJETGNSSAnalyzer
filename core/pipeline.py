@@ -113,6 +113,21 @@ def _position_accuracy_summary(trajectory_points):
     }
 
 
+def _cruise_avg(heights):
+    if not heights:
+        return None
+    lo, hi = min(heights), max(heights)
+    rng = hi - lo
+    if rng < 5:
+        return sum(heights) / len(heights)
+    threshold = lo + rng * 0.60
+    above = [i for i, h in enumerate(heights) if h >= threshold]
+    if not above:
+        return sum(heights) / len(heights)
+    cruise = heights[above[0]: above[-1] + 1]
+    return sum(cruise) / len(cruise)
+
+
 def _altitude_summary(trajectory_points):
     if not trajectory_points:
         return None
@@ -121,7 +136,7 @@ def _altitude_summary(trajectory_points):
     return {
         "min_height": min(heights),
         "max_height": max(heights),
-        "avg_height": sum(heights) / len(heights),
+        "avg_height": _cruise_avg(heights),
         "height_range": max(heights) - min(heights),
     }
 
@@ -175,6 +190,8 @@ def run_pipeline(cnb_file, progress_callback=None, basemap=None):
     runner = ProjectRunner(cnb_file)
     runner.prepare_folders()
 
+    name = os.path.splitext(os.path.basename(cnb_file))[0]
+
     _report(progress_callback, 2, "Анализ CNB файла...")
     CnbAnalysis(cnb_file).analyze()
 
@@ -185,7 +202,7 @@ def run_pipeline(cnb_file, progress_callback=None, basemap=None):
 
     altitude_png = None
     if trajectory_points:
-        altitude_png = os.path.join(runner.plots_dir, "altitude_profile.png")
+        altitude_png = os.path.join(runner.plots_dir, f"{name}_altitude_profile.png")
         AltitudeProfilePlot(trajectory_points, altitude_png).show()
 
     _report(progress_callback, 18, "Извлечение GPS-эфемерид из CNB...")
@@ -197,7 +214,7 @@ def run_pipeline(cnb_file, progress_callback=None, basemap=None):
 
     pdop_png = None
     if pdop_series:
-        pdop_png = os.path.join(runner.plots_dir, "pdop.png")
+        pdop_png = os.path.join(runner.plots_dir, f"{name}_pdop.png")
         PdopPlot(pdop_series, pdop_png).show()
 
     _report(progress_callback, 40, "Анализ временных меток фото...")
@@ -220,7 +237,7 @@ def run_pipeline(cnb_file, progress_callback=None, basemap=None):
     n = min(len(epoch_times), len(epoch_counts))
 
     _report(progress_callback, 75, "Построение графика спутников...")
-    satellites_png = os.path.join(runner.plots_dir, "satellites.png")
+    satellites_png = os.path.join(runner.plots_dir, f"{name}_satellites.png")
     sat_plot = SatellitesPlot(
         epoch_times[:n],
         epoch_counts[:n],
@@ -231,14 +248,14 @@ def run_pipeline(cnb_file, progress_callback=None, basemap=None):
     _report(progress_callback, 80, "Анализ качества фотосъёмки...")
     quality = PhotoQuality(tm["timemarks"]).analyze()
 
-    photo_intervals_png = os.path.join(runner.plots_dir, "photo_intervals.png")
+    photo_intervals_png = os.path.join(runner.plots_dir, f"{name}_photo_intervals.png")
     TimemarkIntervalPlot(tm["timemarks"], photo_intervals_png).show()
 
-    photo_histogram_png = os.path.join(runner.plots_dir, "photo_histogram.png")
+    photo_histogram_png = os.path.join(runner.plots_dir, f"{name}_photo_histogram.png")
     TimemarkHistogram(tm["timemarks"], photo_histogram_png).show()
 
     _report(progress_callback, 88, "Сопоставление фото со спутниками...")
-    csv_path = os.path.join(runner.reports_dir, "photo_satellite_report.csv")
+    csv_path = os.path.join(runner.reports_dir, f"{name}_photo_satellite_report.csv")
     photo_result = PhotoSatelliteReport(
         tm["timemarks"],
         sat_result["epoch_times"],
@@ -261,7 +278,7 @@ def run_pipeline(cnb_file, progress_callback=None, basemap=None):
 
     trajectory_png = None
     if trajectory_points:
-        trajectory_png = os.path.join(runner.plots_dir, "trajectory.png")
+        trajectory_png = os.path.join(runner.plots_dir, f"{name}_trajectory.png")
         MissionTrajectoryPlot(
             trajectory_points, photo_points, trajectory_png,
             basemap=basemap or DEFAULT_BASEMAP
@@ -306,10 +323,10 @@ def run_pipeline(cnb_file, progress_callback=None, basemap=None):
     mission_text = MissionReport(mission_data).generate_text()
 
     _report(progress_callback, 95, "Сохранение отчётов и PDF...")
-    txt_path = os.path.join(runner.reports_dir, "mission_report.txt")
+    txt_path = os.path.join(runner.reports_dir, f"{name}_mission_report.txt")
     ReportExporter(mission_data).save_txt(txt_path)
 
-    pdf_path = os.path.join(runner.reports_dir, "mission_report.pdf")
+    pdf_path = os.path.join(runner.reports_dir, f"{name}_mission_report.pdf")
     PdfReport(mission_data, image_dir=runner.plots_dir).generate(pdf_path)
 
     _report(progress_callback, 100, "Готово")
