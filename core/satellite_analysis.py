@@ -1,6 +1,6 @@
 from collections import defaultdict
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from core.obs_file import open_obs
 
 
@@ -78,15 +78,10 @@ class SatelliteAnalysis:
 
                     second = float(parts[6])
 
-                    epoch_time = datetime(
-                        year,
-                        month,
-                        day,
-                        hour,
-                        minute,
-                        int(second),
-                        int((second % 1) * 1_000_000)
-                    )
+                    # Секунды могут быть 60.xxx (артефакт округления у приёмника),
+                    # а datetime не принимает >= 60. Строим от начала минуты и
+                    # добавляем секунды через timedelta — перенос корректный.
+                    epoch_time = datetime(year, month, day, hour, minute) + timedelta(seconds=second)
 
                     epoch_times.append(epoch_time)
 

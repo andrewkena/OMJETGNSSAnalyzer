@@ -1,6 +1,8 @@
 import os
 from collections import Counter
 
+import numpy as np
+
 from core.rinex_time_reader import RinexTimeReader
 from core.time_analysis import TimeAnalysis
 from core.satellite_analysis import SatelliteAnalysis
@@ -16,10 +18,15 @@ from core.project_runner import ProjectRunner
 
 from core.novatel.reader import iter_messages
 from core.novatel.bestpos import decode_bestposb, pos_type_label
-from core.novatel.gps_ephemeris import gps_time_to_datetime, decode_rawephem
+from core.novatel.gps_ephemeris import gps_time_to_datetime, decode_rawephem, GPS_EPOCH
 from core.pdop import compute_pdop_series
 from core.obs_header_reader import read_obs_signal_types, system_name
 from core.obs_file import find_obs_file
+
+from core.ublox.reader import iter_messages as ubx_iter_messages
+from core.ublox.pvt import decode_navpvt
+from core.ublox.navsat import decode_navsat, GNSS_ID_LETTER
+from core.ublox.timemark import decode_timtm2
 
 from plots.satellites_plot import SatellitesPlot
 from plots.timemark_interval_plot import TimemarkIntervalPlot
@@ -30,6 +37,12 @@ from plots.pdop_plot import PdopPlot
 
 MSG_ID_BESTPOS = 42
 MSG_ID_RAWEPHEM = 41
+
+UBX_CLASS_NAV = 0x01
+UBX_ID_NAV_PVT = 0x07
+UBX_ID_NAV_SAT = 0x35
+UBX_CLASS_TIM = 0x0D
+UBX_ID_TIM_TM2 = 0x03
 
 
 def _report(progress_callback, percent, message):
@@ -55,6 +68,7 @@ def _extract_trajectory(cnb_file):
         fix = decode_bestposb(msg.body)
         if fix is not None:
             fix["time"] = gps_time_to_datetime(msg.week, msg.tow_sec)
+            fix["pos_type"] = pos_type_label(fix["pos_type"])
             points.append(fix)
 
     distance_m = sum(
@@ -103,10 +117,8 @@ def _position_accuracy_summary(trajectory_points):
 
     n = len(trajectory_points)
     return {
-        "dominant_type": pos_type_label(dominant_type),
-        "type_breakdown": {
-            pos_type_label(t): c for t, c in type_counts.items()
-        },
+        "dominant_type": dominant_type,
+        "type_breakdown": dict(type_counts),
         "avg_lat_sigma": sum(p["lat_sigma"] for p in trajectory_points) / n,
         "avg_lon_sigma": sum(p["lon_sigma"] for p in trajectory_points) / n,
         "avg_height_sigma": sum(p["height_sigma"] for p in trajectory_points) / n,
@@ -184,7 +196,334 @@ def _pdop_summary(pdop_series):
     }
 
 
+def _ubx_fallback_week(ubx_file):
+    """Best-effort GPS week derived from a NAV-PVT's UTC date, used only when
+    the file has no TIM-TM2 (no photo timemarks) to anchor the week number."""
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_NAV or msg.msg_id != UBX_ID_NAV_PVT:
+            continue
+        fix = decode_navpvt(msg.payload)
+        if fix and fix["utc_datetime"] is not None:
+            return (fix["utc_datetime"] - GPS_EPOCH).days // 7
+    return None
+
+
+def _ubx_extract_timemarks(ubx_file):
+    timemarks = []
+    ref_week = None
+
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_TIM or msg.msg_id != UBX_ID_TIM_TM2:
+            continue
+
+        result = decode_timtm2(msg.payload)
+        if result is None:
+            continue
+
+        dt, week = result
+        timemarks.append(dt)
+        if ref_week is None:
+            ref_week = week
+
+    if ref_week is None:
+        ref_week = _ubx_fallback_week(ubx_file)
+
+    return timemarks, ref_week
+
+
+def _ubx_extract_trajectory(ubx_file, ref_week):
+    if ref_week is None:
+        return [], 0.0
+
+    points = []
+    prev_itow = None
+    week = ref_week
+
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_NAV or msg.msg_id != UBX_ID_NAV_PVT:
+            continue
+
+        fix = decode_navpvt(msg.payload)
+        if fix is None:
+            continue
+
+        itow = fix["iTOW"]
+        # A large backward jump in iTOW only happens on a GPS week rollover.
+        if prev_itow is not None and itow < prev_itow - 100_000:
+            week += 1
+        prev_itow = itow
+
+        fix["time"] = gps_time_to_datetime(week, itow / 1000.0)
+        points.append(fix)
+
+    distance_m = sum(
+        _haversine_m(
+            points[i]["lat"], points[i]["lon"],
+            points[i + 1]["lat"], points[i + 1]["lon"]
+        )
+        for i in range(len(points) - 1)
+    )
+
+    return points, distance_m
+
+
+def _empty_satellite_result():
+    return {
+        "zero_sat_epochs": 0,
+        "min_time": None,
+        "max_time": None,
+        "epoch_times": [],
+        "epoch_sat_counts": [],
+        "avg_satellites": 0.0,
+        "min_satellites": 0,
+        "max_satellites": 0,
+        "gps_avg": 0.0,
+        "glo_avg": 0.0,
+        "gal_avg": 0.0,
+        "bds_avg": 0.0,
+        "unique_satellites": 0,
+    }
+
+
+def _ubx_extract_satellites(ubx_file, ref_week):
+    if ref_week is None:
+        return _empty_satellite_result()
+
+    epoch_times = []
+    epoch_counts = []
+    gps_counts = []
+    glo_counts = []
+    gal_counts = []
+    bds_counts = []
+    unique_satellites = set()
+
+    prev_itow = None
+    week = ref_week
+
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_NAV or msg.msg_id != UBX_ID_NAV_SAT:
+            continue
+
+        result = decode_navsat(msg.payload)
+        if result is None:
+            continue
+
+        itow, satellites = result
+        if prev_itow is not None and itow < prev_itow - 100_000:
+            week += 1
+        prev_itow = itow
+
+        epoch_times.append(gps_time_to_datetime(week, itow / 1000.0))
+
+        used = [s for s in satellites if s["used"]]
+        epoch_counts.append(len(used))
+
+        gps_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "G"))
+        glo_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "R"))
+        gal_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "E"))
+        bds_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "C"))
+
+        for s in used:
+            letter = GNSS_ID_LETTER.get(s["gnssId"])
+            if letter:
+                unique_satellites.add(f"{letter}{s['svId']:02d}")
+
+    if not epoch_counts:
+        return _empty_satellite_result()
+
+    counts_arr = np.array(epoch_counts)
+    min_idx = int(np.argmin(counts_arr))
+    max_idx = int(np.argmax(counts_arr))
+
+    return {
+        "zero_sat_epochs": int(np.sum(counts_arr == 0)),
+        "min_time": epoch_times[min_idx],
+        "max_time": epoch_times[max_idx],
+        "epoch_times": epoch_times,
+        "epoch_sat_counts": epoch_counts,
+        "avg_satellites": float(np.mean(counts_arr)),
+        "min_satellites": int(np.min(counts_arr)),
+        "max_satellites": int(np.max(counts_arr)),
+        "gps_avg": float(np.mean(gps_counts)),
+        "glo_avg": float(np.mean(glo_counts)),
+        "gal_avg": float(np.mean(gal_counts)),
+        "bds_avg": float(np.mean(bds_counts)),
+        "unique_satellites": len(unique_satellites),
+    }
+
+
+def run_pipeline_ubx(ubx_file, progress_callback=None, basemap=None):
+    runner = ProjectRunner(ubx_file)
+    runner.prepare_folders()
+
+    name = os.path.splitext(os.path.basename(ubx_file))[0]
+
+    _report(progress_callback, 5, "Извлечение фотометок (TIM-TM2)...")
+    timemarks, ref_week = _ubx_extract_timemarks(ubx_file)
+
+    _report(progress_callback, 15, "Извлечение траектории (NAV-PVT)...")
+    trajectory_points, trajectory_distance_m = _ubx_extract_trajectory(ubx_file, ref_week)
+    position_accuracy = _position_accuracy_summary(trajectory_points)
+    altitude_summary = _altitude_summary(trajectory_points)
+
+    altitude_png = None
+    if trajectory_points:
+        altitude_png = os.path.join(runner.plots_dir, f"{name}_altitude_profile.png")
+        AltitudeProfilePlot(trajectory_points, altitude_png).show()
+
+    pdop_series = [
+        {"time": p["time"], "pdop": p["pdop"], "num_sats": p["num_svs"]}
+        for p in trajectory_points if p["pdop"] > 0
+    ]
+    pdop_summary = _pdop_summary(pdop_series)
+
+    pdop_png = None
+    if pdop_series:
+        pdop_png = os.path.join(runner.plots_dir, f"{name}_pdop.png")
+        PdopPlot(pdop_series, pdop_png).show()
+
+    _report(progress_callback, 45, "Анализ времени съёмки...")
+    time_result = TimeAnalysis(np.array(
+        [p["time"] for p in trajectory_points], dtype="datetime64[ms]"
+    )).get_summary()
+
+    matched_fixes = _match_photos_to_trajectory(timemarks, trajectory_points)
+
+    _report(progress_callback, 58, "Анализ спутников (NAV-SAT)...")
+    sat_result = _ubx_extract_satellites(ubx_file, ref_week)
+    signal_summary = None
+
+    epoch_times = sat_result["epoch_times"]
+    epoch_counts = sat_result["epoch_sat_counts"]
+    n = min(len(epoch_times), len(epoch_counts))
+
+    _report(progress_callback, 75, "Построение графика спутников...")
+    satellites_png = os.path.join(runner.plots_dir, f"{name}_satellites.png")
+    SatellitesPlot(epoch_times[:n], epoch_counts[:n], satellites_png).show()
+
+    _report(progress_callback, 80, "Анализ качества фотосъёмки...")
+    quality = PhotoQuality(timemarks).analyze()
+
+    photo_intervals_png = os.path.join(runner.plots_dir, f"{name}_photo_intervals.png")
+    TimemarkIntervalPlot(timemarks, photo_intervals_png).show()
+
+    photo_histogram_png = os.path.join(runner.plots_dir, f"{name}_photo_histogram.png")
+    TimemarkHistogram(timemarks, photo_histogram_png).show()
+
+    _report(progress_callback, 88, "Сопоставление фото со спутниками...")
+    csv_path = os.path.join(runner.reports_dir, f"{name}_photo_satellite_report.csv")
+    photo_result = PhotoSatelliteReport(
+        timemarks,
+        sat_result["epoch_times"],
+        sat_result["epoch_sat_counts"],
+        csv_path,
+        fixes=matched_fixes,
+    ).analyze()
+
+    report = photo_result["report"]
+    good_count = photo_result["good"]
+    normal_count = photo_result["normal"]
+    low_count = photo_result["low"]
+    good_percent = (good_count / len(report)) * 100
+
+    _report(progress_callback, 91, "Построение траектории с метками фото...")
+    photo_points = [
+        {**fix, "quality": report[i]["quality"], "height": report[i].get("height")}
+        for i, fix in enumerate(matched_fixes)
+    ]
+
+    trajectory_png = None
+    if trajectory_points:
+        trajectory_png = os.path.join(runner.plots_dir, f"{name}_trajectory.png")
+        MissionTrajectoryPlot(
+            trajectory_points, photo_points, trajectory_png,
+            basemap=basemap or DEFAULT_BASEMAP
+        ).show()
+
+    if sat_result["avg_satellites"] >= 20:
+        gnss_quality = "EXCELLENT"
+    elif sat_result["avg_satellites"] >= 15:
+        gnss_quality = "GOOD"
+    elif sat_result["avg_satellites"] >= 10:
+        gnss_quality = "NORMAL"
+    else:
+        gnss_quality = "POOR"
+
+    mission = MissionQuality(
+        quality["quality"],
+        gnss_quality,
+        good_percent
+    ).analyze()
+
+    mission_data = {
+        "photo_quality": quality["quality"],
+        "gnss_quality": gnss_quality,
+
+        "good_count": good_count,
+        "normal_count": normal_count,
+        "low_count": low_count,
+
+        "good_percent": good_percent,
+
+        "avg_satellites": sum(r["satellites"] for r in report) / len(report),
+        "min_satellites": min(r["satellites"] for r in report),
+        "max_satellites": max(r["satellites"] for r in report),
+
+        "photo_count": len(report),
+        "flight_duration_min": time_result["duration_sec"] / 60,
+        "unique_satellites": sat_result["unique_satellites"],
+
+        "final_score": mission["final"]
+    }
+
+    mission_text = MissionReport(mission_data).generate_text()
+
+    _report(progress_callback, 95, "Сохранение отчётов и PDF...")
+    txt_path = os.path.join(runner.reports_dir, f"{name}_mission_report.txt")
+    ReportExporter(mission_data).save_txt(txt_path)
+
+    pdf_path = os.path.join(runner.reports_dir, f"{name}_mission_report.pdf")
+    PdfReport(mission_data, image_dir=runner.plots_dir).generate(pdf_path)
+
+    _report(progress_callback, 100, "Готово")
+
+    return {
+        "runner": runner,
+        "time_result": time_result,
+        "signal_summary": signal_summary,
+        "sat_result": sat_result,
+        "photo_quality": quality,
+        "photo_report": report,
+        "matched_fixes": matched_fixes,
+        "mission_data": mission_data,
+        "mission_text": mission_text,
+        "trajectory": {
+            "points": trajectory_points,
+            "distance_m": trajectory_distance_m,
+            "position_accuracy": position_accuracy,
+            "altitude": altitude_summary,
+        },
+        "pdop": pdop_summary,
+        "plots": {
+            "satellites": satellites_png,
+            "photo_intervals": photo_intervals_png,
+            "photo_histogram": photo_histogram_png,
+            "trajectory": trajectory_png,
+            "altitude_profile": altitude_png,
+            "pdop": pdop_png,
+        },
+        "files": {
+            "csv": csv_path,
+            "txt": txt_path,
+            "pdf": pdf_path,
+        }
+    }
+
+
 def run_pipeline(cnb_file, progress_callback=None, basemap=None):
+    if cnb_file.lower().endswith(".ubx"):
+        return run_pipeline_ubx(cnb_file, progress_callback=progress_callback, basemap=basemap)
+
     obs_file = find_obs_file(cnb_file)
 
     runner = ProjectRunner(cnb_file)

@@ -29,10 +29,14 @@ class RinexTimeReader:
 
                 second = float(parts[6])
 
-                dt = np.datetime64(
+                # Секунды могут быть 60.xxx (артефакт округления у приёмника),
+                # а np.datetime64 не принимает >= 60. Строим время от начала
+                # минуты и добавляем секунды как timedelta — перенос корректный.
+                base = np.datetime64(
                     f"{year:04d}-{month:02d}-{day:02d}T"
-                    f"{hour:02d}:{minute:02d}:{second:06.3f}"
+                    f"{hour:02d}:{minute:02d}:00"
                 )
+                dt = base + np.timedelta64(int(round(second * 1000)), "ms")
 
                 times.append(dt)
 

@@ -17,7 +17,7 @@ from core.pipeline import run_pipeline
 from plots.map_widget import MapWidget, BASEMAP_KEYS, DEFAULT_BASEMAP
 from plots.height_profile_widget import HeightProfileWidget
 
-APP_VERSION = "0.26_15.07.2026"
+APP_VERSION = "0.27_30.09.2026"
 APP_AUTHOR = "andrewkena"
 
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -1043,42 +1043,50 @@ class GnssAnalyzerApp:
     def choose_file(self):
         self._msginfo(
             "Подготовка к анализу",
-            "Для анализа необходимы два файла в одной папке:\n\n"
-            "  • Файл данных приёмника:  имя_файла.cnb\n"
-            "  • Файл наблюдений RINEX:  имя_файла.cnb.obs\n"
-            "                        или  имя_файла.cnb.obs.gz\n\n"
-            "Файл .obs создаётся утилитой конвертации производителя\n"
-            "(CnbConverter / NovAtel Convert) и должен лежать\n"
-            "рядом с .cnb файлом.\n\n"
+            "Поддерживаются два формата приёмника:\n\n"
+            "  • Novatel/SinoGNSS — два файла в одной папке:\n"
+            "      имя_файла.cnb\n"
+            "      имя_файла.cnb.obs  (или  .cnb.obs.gz)\n"
+            "    Файл .obs создаётся утилитой конвертации производителя\n"
+            "    (CnbConverter / NovAtel Convert) и должен лежать\n"
+            "    рядом с .cnb файлом.\n\n"
+            "  • u-blox — один файл имя_файла.ubx, ничего конвертировать\n"
+            "    не нужно.\n\n"
             "Обработка большого файла может занять несколько минут."
         )
         path = filedialog.askopenfilename(
-            title="Выберите CNB файл",
+            title="Выберите файл приёмника",
             initialdir=self._last_dir,
-            filetypes=[("CNB файлы", "*.cnb"), ("Все файлы", "*.*")]
+            filetypes=[
+                ("GNSS файлы", "*.cnb *.ubx"),
+                ("CNB файлы", "*.cnb"),
+                ("UBX файлы", "*.ubx"),
+                ("Все файлы", "*.*"),
+            ]
         )
         if not path:
             return
 
         self._last_dir = os.path.dirname(path)
 
-        obs_path = path + ".obs"
-        obs_path_gz = path + ".obs.gz"
-        if not os.path.isfile(obs_path) and not os.path.isfile(obs_path_gz):
-            self.status_var.set(
-                f"⚠ Не найден {os.path.basename(obs_path)} — конвертируйте .cnb в RINEX OBS"
-            )
-            self._msgwarn(
-                "Отсутствует файл OBS",
-                f"Файл наблюдений RINEX OBS не найден:\n\n"
-                f"{obs_path}\n\n"
-                f"Сконвертируйте .cnb с помощью утилиты производителя "
-                f"(CnbConverter / NovAtel Convert). Файл должен называться\n"
-                f"«{os.path.basename(obs_path)}» или «{os.path.basename(obs_path_gz)}» "
-                f"и лежать в той же папке.\n\n"
-                f"После появления файла выберите .cnb снова."
-            )
-            return
+        if not path.lower().endswith(".ubx"):
+            obs_path = path + ".obs"
+            obs_path_gz = path + ".obs.gz"
+            if not os.path.isfile(obs_path) and not os.path.isfile(obs_path_gz):
+                self.status_var.set(
+                    f"⚠ Не найден {os.path.basename(obs_path)} — конвертируйте .cnb в RINEX OBS"
+                )
+                self._msgwarn(
+                    "Отсутствует файл OBS",
+                    f"Файл наблюдений RINEX OBS не найден:\n\n"
+                    f"{obs_path}\n\n"
+                    f"Сконвертируйте .cnb с помощью утилиты производителя "
+                    f"(CnbConverter / NovAtel Convert). Файл должен называться\n"
+                    f"«{os.path.basename(obs_path)}» или «{os.path.basename(obs_path_gz)}» "
+                    f"и лежать в той же папке.\n\n"
+                    f"После появления файла выберите .cnb снова."
+                )
+                return
 
         self.cnb_file = path
         self.file_label.configure(text=os.path.basename(path))
@@ -1899,15 +1907,20 @@ class MultitrackWindow:
     def _add_files(self):
         self.app._msginfo(
             "Загрузка файлов",
-            "При загрузке больших CNB-файлов обработка может занять некоторое время.\n\n"
+            "При загрузке больших файлов обработка может занять некоторое время.\n\n"
             "Программа не зависнет — дождитесь появления треков на карте.",
             parent=self.win
         )
         paths = filedialog.askopenfilenames(
             parent=self.win,
-            title="Выберите CNB файлы",
+            title="Выберите файлы приёмника",
             initialdir=self._last_dir,
-            filetypes=[("CNB файлы", "*.cnb"), ("Все файлы", "*.*")]
+            filetypes=[
+                ("GNSS файлы", "*.cnb *.ubx"),
+                ("CNB файлы", "*.cnb"),
+                ("UBX файлы", "*.ubx"),
+                ("Все файлы", "*.*"),
+            ]
         )
         if not paths:
             return
@@ -1928,19 +1941,24 @@ class MultitrackWindow:
         ).start()
 
     def _extract_and_draw(self, path, color, label):
-        from core.novatel.reader import iter_messages
-        from core.novatel.bestpos import decode_bestposb
-        from core.novatel.gps_ephemeris import gps_time_to_datetime
-        MSG_ID_BESTPOS = 42
         points = []
         try:
-            for msg in iter_messages(path):
-                if msg.msg_id != MSG_ID_BESTPOS:
-                    continue
-                fix = decode_bestposb(msg.body)
-                if fix is not None:
-                    fix["time"] = gps_time_to_datetime(msg.week, msg.tow_sec)
-                    points.append(fix)
+            if path.lower().endswith(".ubx"):
+                from core.pipeline import _ubx_extract_trajectory, _ubx_fallback_week
+                ref_week = _ubx_fallback_week(path)
+                points, _ = _ubx_extract_trajectory(path, ref_week)
+            else:
+                from core.novatel.reader import iter_messages
+                from core.novatel.bestpos import decode_bestposb
+                from core.novatel.gps_ephemeris import gps_time_to_datetime
+                MSG_ID_BESTPOS = 42
+                for msg in iter_messages(path):
+                    if msg.msg_id != MSG_ID_BESTPOS:
+                        continue
+                    fix = decode_bestposb(msg.body)
+                    if fix is not None:
+                        fix["time"] = gps_time_to_datetime(msg.week, msg.tow_sec)
+                        points.append(fix)
         except Exception as e:
             self.win.after(0, lambda: self._on_track_failed(label, e))
             return
