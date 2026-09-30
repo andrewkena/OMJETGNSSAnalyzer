@@ -27,6 +27,11 @@ from core.ublox.reader import iter_messages as ubx_iter_messages
 from core.ublox.pvt import decode_navpvt
 from core.ublox.navsat import decode_navsat, GNSS_ID_LETTER
 from core.ublox.timemark import decode_timtm2
+from core.ublox.posecef import decode_navposecef
+from core.ublox.posllh import decode_navposllh
+from core.ublox.navstatus import decode_navstatus
+from core.ublox.timeutc import decode_navtimeutc
+from core.ublox.rawx import decode_rxmrawx
 
 from plots.satellites_plot import SatellitesPlot
 from plots.timemark_interval_plot import TimemarkIntervalPlot
@@ -39,8 +44,14 @@ MSG_ID_BESTPOS = 42
 MSG_ID_RAWEPHEM = 41
 
 UBX_CLASS_NAV = 0x01
+UBX_ID_NAV_POSECEF = 0x01
+UBX_ID_NAV_POSLLH = 0x02
+UBX_ID_NAV_STATUS = 0x03
 UBX_ID_NAV_PVT = 0x07
+UBX_ID_NAV_TIMEUTC = 0x21
 UBX_ID_NAV_SAT = 0x35
+UBX_CLASS_RXM = 0x02
+UBX_ID_RXM_RAWX = 0x15
 UBX_CLASS_TIM = 0x0D
 UBX_ID_TIM_TM2 = 0x03
 
@@ -196,9 +207,7 @@ def _pdop_summary(pdop_series):
     }
 
 
-def _ubx_fallback_week(ubx_file):
-    """Best-effort GPS week derived from a NAV-PVT's UTC date, used only when
-    the file has no TIM-TM2 (no photo timemarks) to anchor the week number."""
+def _ubx_week_from_navpvt(ubx_file):
     for msg in ubx_iter_messages(ubx_file):
         if msg.msg_class != UBX_CLASS_NAV or msg.msg_id != UBX_ID_NAV_PVT:
             continue
@@ -208,33 +217,72 @@ def _ubx_fallback_week(ubx_file):
     return None
 
 
-def _ubx_extract_timemarks(ubx_file):
-    timemarks = []
-    ref_week = None
+def _ubx_week_from_navtimeutc(ubx_file):
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_NAV or msg.msg_id != UBX_ID_NAV_TIMEUTC:
+            continue
+        dt = decode_navtimeutc(msg.payload)
+        if dt is not None:
+            return (dt - GPS_EPOCH).days // 7
+    return None
 
+
+def _ubx_week_from_rawx(ubx_file):
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_RXM or msg.msg_id != UBX_ID_RXM_RAWX:
+            continue
+        result = decode_rxmrawx(msg.payload)
+        if result is not None:
+            return result[0]
+    return None
+
+
+def _ubx_ref_week(ubx_file):
+    """GPS week anchor for messages that only carry iTOW (ms of week).
+    Tried in order of reliability: TIM-TM2 and RXM-RAWX carry an exact week
+    number directly; NAV-TIMEUTC/NAV-PVT only give a UTC date, from which the
+    week is derived approximately (fine -- the 18s GPS/UTC leap offset never
+    crosses a week boundary in practice)."""
     for msg in ubx_iter_messages(ubx_file):
         if msg.msg_class != UBX_CLASS_TIM or msg.msg_id != UBX_ID_TIM_TM2:
             continue
-
         result = decode_timtm2(msg.payload)
-        if result is None:
+        if result is not None:
+            return result[1]
+
+    week = _ubx_week_from_rawx(ubx_file)
+    if week is not None:
+        return week
+
+    week = _ubx_week_from_navtimeutc(ubx_file)
+    if week is not None:
+        return week
+
+    return _ubx_week_from_navpvt(ubx_file)
+
+
+def _ubx_extract_timemarks(ubx_file):
+    timemarks = []
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_TIM or msg.msg_id != UBX_ID_TIM_TM2:
             continue
-
-        dt, week = result
-        timemarks.append(dt)
-        if ref_week is None:
-            ref_week = week
-
-    if ref_week is None:
-        ref_week = _ubx_fallback_week(ubx_file)
-
-    return timemarks, ref_week
+        result = decode_timtm2(msg.payload)
+        if result is not None:
+            timemarks.append(result[0])
+    return timemarks
 
 
-def _ubx_extract_trajectory(ubx_file, ref_week):
-    if ref_week is None:
-        return [], 0.0
+def _trajectory_distance(points):
+    return sum(
+        _haversine_m(
+            points[i]["lat"], points[i]["lon"],
+            points[i + 1]["lat"], points[i + 1]["lon"]
+        )
+        for i in range(len(points) - 1)
+    )
 
+
+def _ubx_trajectory_from_navpvt(ubx_file, ref_week):
     points = []
     prev_itow = None
     week = ref_week
@@ -256,15 +304,81 @@ def _ubx_extract_trajectory(ubx_file, ref_week):
         fix["time"] = gps_time_to_datetime(week, itow / 1000.0)
         points.append(fix)
 
-    distance_m = sum(
-        _haversine_m(
-            points[i]["lat"], points[i]["lon"],
-            points[i + 1]["lat"], points[i + 1]["lon"]
-        )
-        for i in range(len(points) - 1)
-    )
+    return points
 
-    return points, distance_m
+
+def _ubx_trajectory_from_raw_nav(ubx_file, ref_week):
+    """Fallback for receivers configured for raw-data (PPK) logging, which
+    typically omit NAV-PVT: position comes from NAV-POSLLH (preferred) or
+    NAV-POSECEF, fix quality/RTK state from NAV-STATUS, matched by iTOW.
+    None of these carry a satellite count or DOP, so those fields are unset."""
+    pos_by_itow = {}
+    ecef_by_itow = {}
+    status_by_itow = {}
+
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_NAV:
+            continue
+        if msg.msg_id == UBX_ID_NAV_POSLLH:
+            fix = decode_navposllh(msg.payload)
+            if fix:
+                pos_by_itow[fix["iTOW"]] = fix
+        elif msg.msg_id == UBX_ID_NAV_POSECEF:
+            fix = decode_navposecef(msg.payload)
+            if fix:
+                ecef_by_itow[fix["iTOW"]] = fix
+        elif msg.msg_id == UBX_ID_NAV_STATUS:
+            status = decode_navstatus(msg.payload)
+            if status:
+                status_by_itow[status["iTOW"]] = status
+
+    # NAV-POSLLH gives lat/lon/height directly and needs no coordinate
+    # conversion -- prefer it, falling back to ECEF only if it's not logged.
+    if not pos_by_itow:
+        pos_by_itow = ecef_by_itow
+
+    points = []
+    prev_itow = None
+    week = ref_week
+
+    for itow in sorted(pos_by_itow):
+        # Rollover tracking runs over the raw iTOW sequence regardless of
+        # whether the fix at this iTOW ends up filtered out below.
+        if prev_itow is not None and itow < prev_itow - 100_000:
+            week += 1
+        prev_itow = itow
+
+        fix = dict(pos_by_itow[itow])
+        status = status_by_itow.get(itow)
+
+        # No-fix epochs decode to a degenerate ECEF(0,0,0) -> lat=180, height
+        # near -6378137 m. NAV-STATUS is the authoritative check; the height
+        # sanity bound is a defensive fallback if NAV-STATUS isn't logged.
+        if status is not None and status["pos_type"] == "NONE":
+            continue
+        if abs(fix["height"]) > 100_000:
+            continue
+
+        fix["pos_type"] = status["pos_type"] if status else "SINGLE"
+        fix["num_svs"] = None
+        fix["num_soln_svs"] = None
+        fix["pdop"] = 0.0  # not available without NAV-PVT
+
+        fix["time"] = gps_time_to_datetime(week, itow / 1000.0)
+        points.append(fix)
+
+    return points
+
+
+def _ubx_extract_trajectory(ubx_file, ref_week):
+    if ref_week is None:
+        return [], 0.0
+
+    points = _ubx_trajectory_from_navpvt(ubx_file, ref_week)
+    if not points:
+        points = _ubx_trajectory_from_raw_nav(ubx_file, ref_week)
+
+    return points, _trajectory_distance(points)
 
 
 def _empty_satellite_result():
@@ -285,49 +399,7 @@ def _empty_satellite_result():
     }
 
 
-def _ubx_extract_satellites(ubx_file, ref_week):
-    if ref_week is None:
-        return _empty_satellite_result()
-
-    epoch_times = []
-    epoch_counts = []
-    gps_counts = []
-    glo_counts = []
-    gal_counts = []
-    bds_counts = []
-    unique_satellites = set()
-
-    prev_itow = None
-    week = ref_week
-
-    for msg in ubx_iter_messages(ubx_file):
-        if msg.msg_class != UBX_CLASS_NAV or msg.msg_id != UBX_ID_NAV_SAT:
-            continue
-
-        result = decode_navsat(msg.payload)
-        if result is None:
-            continue
-
-        itow, satellites = result
-        if prev_itow is not None and itow < prev_itow - 100_000:
-            week += 1
-        prev_itow = itow
-
-        epoch_times.append(gps_time_to_datetime(week, itow / 1000.0))
-
-        used = [s for s in satellites if s["used"]]
-        epoch_counts.append(len(used))
-
-        gps_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "G"))
-        glo_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "R"))
-        gal_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "E"))
-        bds_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "C"))
-
-        for s in used:
-            letter = GNSS_ID_LETTER.get(s["gnssId"])
-            if letter:
-                unique_satellites.add(f"{letter}{s['svId']:02d}")
-
+def _aggregate_satellite_counts(epoch_times, epoch_counts, gps_counts, glo_counts, gal_counts, bds_counts, unique_satellites):
     if not epoch_counts:
         return _empty_satellite_result()
 
@@ -352,16 +424,109 @@ def _ubx_extract_satellites(ubx_file, ref_week):
     }
 
 
+def _ubx_satellites_from_navsat(ubx_file, ref_week):
+    epoch_times, epoch_counts = [], []
+    gps_counts, glo_counts, gal_counts, bds_counts = [], [], [], []
+    unique_satellites = set()
+
+    prev_itow = None
+    week = ref_week
+
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_NAV or msg.msg_id != UBX_ID_NAV_SAT:
+            continue
+
+        result = decode_navsat(msg.payload)
+        if result is None:
+            continue
+
+        itow, satellites = result
+        if prev_itow is not None and itow < prev_itow - 100_000:
+            week += 1
+        prev_itow = itow
+
+        epoch_times.append(gps_time_to_datetime(week, itow / 1000.0))
+
+        used = [s for s in satellites if s["used"]]
+        epoch_counts.append(len(used))
+        gps_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "G"))
+        glo_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "R"))
+        gal_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "E"))
+        bds_counts.append(sum(1 for s in used if GNSS_ID_LETTER.get(s["gnssId"]) == "C"))
+
+        for s in used:
+            letter = GNSS_ID_LETTER.get(s["gnssId"])
+            if letter:
+                unique_satellites.add(f"{letter}{s['svId']:02d}")
+
+    return _aggregate_satellite_counts(
+        epoch_times, epoch_counts, gps_counts, glo_counts, gal_counts, bds_counts, unique_satellites
+    )
+
+
+def _ubx_satellites_from_rawx(ubx_file):
+    """Fallback for raw-data (PPK) logging configs that omit NAV-SAT: each
+    RXM-RAWX record already carries an exact (week, rcvTow), so no iTOW
+    anchoring is needed here. "Used" means the raw pseudorange was flagged
+    valid (trkStat.prValid) -- the closest available proxy for svUsed when
+    the nav engine's own satellite-usage message isn't logged."""
+    epoch_times, epoch_counts = [], []
+    gps_counts, glo_counts, gal_counts, bds_counts = [], [], [], []
+    unique_satellites = set()
+
+    for msg in ubx_iter_messages(ubx_file):
+        if msg.msg_class != UBX_CLASS_RXM or msg.msg_id != UBX_ID_RXM_RAWX:
+            continue
+
+        result = decode_rxmrawx(msg.payload)
+        if result is None:
+            continue
+
+        week, rcv_tow, measurements = result
+        epoch_times.append(gps_time_to_datetime(week, rcv_tow))
+
+        # A single satellite can appear as several measurement blocks (one
+        # per tracked signal/frequency) -- dedupe by (gnssId, svId) so a
+        # dual-frequency satellite isn't counted twice.
+        used_svs = {(m["gnssId"], m["svId"]) for m in measurements if m["used"]}
+        epoch_counts.append(len(used_svs))
+        gps_counts.append(sum(1 for gnss_id, _ in used_svs if GNSS_ID_LETTER.get(gnss_id) == "G"))
+        glo_counts.append(sum(1 for gnss_id, _ in used_svs if GNSS_ID_LETTER.get(gnss_id) == "R"))
+        gal_counts.append(sum(1 for gnss_id, _ in used_svs if GNSS_ID_LETTER.get(gnss_id) == "E"))
+        bds_counts.append(sum(1 for gnss_id, _ in used_svs if GNSS_ID_LETTER.get(gnss_id) == "C"))
+
+        for gnss_id, sv_id in used_svs:
+            letter = GNSS_ID_LETTER.get(gnss_id)
+            if letter:
+                unique_satellites.add(f"{letter}{sv_id:02d}")
+
+    return _aggregate_satellite_counts(
+        epoch_times, epoch_counts, gps_counts, glo_counts, gal_counts, bds_counts, unique_satellites
+    )
+
+
+def _ubx_extract_satellites(ubx_file, ref_week):
+    if ref_week is not None:
+        result = _ubx_satellites_from_navsat(ubx_file, ref_week)
+        if result["epoch_sat_counts"]:
+            return result
+
+    return _ubx_satellites_from_rawx(ubx_file)
+
+
 def run_pipeline_ubx(ubx_file, progress_callback=None, basemap=None):
     runner = ProjectRunner(ubx_file)
     runner.prepare_folders()
 
     name = os.path.splitext(os.path.basename(ubx_file))[0]
 
-    _report(progress_callback, 5, "Извлечение фотометок (TIM-TM2)...")
-    timemarks, ref_week = _ubx_extract_timemarks(ubx_file)
+    _report(progress_callback, 3, "Определение опорной GPS-недели...")
+    ref_week = _ubx_ref_week(ubx_file)
 
-    _report(progress_callback, 15, "Извлечение траектории (NAV-PVT)...")
+    _report(progress_callback, 5, "Извлечение фотометок (TIM-TM2)...")
+    timemarks = _ubx_extract_timemarks(ubx_file)
+
+    _report(progress_callback, 15, "Извлечение траектории (NAV-PVT/NAV-POSECEF)...")
     trajectory_points, trajectory_distance_m = _ubx_extract_trajectory(ubx_file, ref_week)
     position_accuracy = _position_accuracy_summary(trajectory_points)
     altitude_summary = _altitude_summary(trajectory_points)
@@ -389,7 +554,7 @@ def run_pipeline_ubx(ubx_file, progress_callback=None, basemap=None):
 
     matched_fixes = _match_photos_to_trajectory(timemarks, trajectory_points)
 
-    _report(progress_callback, 58, "Анализ спутников (NAV-SAT)...")
+    _report(progress_callback, 58, "Анализ спутников (NAV-SAT/RXM-RAWX)...")
     sat_result = _ubx_extract_satellites(ubx_file, ref_week)
     signal_summary = None
 
@@ -402,13 +567,25 @@ def run_pipeline_ubx(ubx_file, progress_callback=None, basemap=None):
     SatellitesPlot(epoch_times[:n], epoch_counts[:n], satellites_png).show()
 
     _report(progress_callback, 80, "Анализ качества фотосъёмки...")
-    quality = PhotoQuality(timemarks).analyze()
+    if timemarks:
+        quality = PhotoQuality(timemarks).analyze()
 
-    photo_intervals_png = os.path.join(runner.plots_dir, f"{name}_photo_intervals.png")
-    TimemarkIntervalPlot(timemarks, photo_intervals_png).show()
+        photo_intervals_png = os.path.join(runner.plots_dir, f"{name}_photo_intervals.png")
+        TimemarkIntervalPlot(timemarks, photo_intervals_png).show()
 
-    photo_histogram_png = os.path.join(runner.plots_dir, f"{name}_photo_histogram.png")
-    TimemarkHistogram(timemarks, photo_histogram_png).show()
+        photo_histogram_png = os.path.join(runner.plots_dir, f"{name}_photo_histogram.png")
+        TimemarkHistogram(timemarks, photo_histogram_png).show()
+    else:
+        # No TIM-TM2 in the file (e.g. a test/calibration log without a
+        # camera) -- report the mission without a photo-quality section
+        # rather than crashing on empty timemark statistics.
+        quality = {
+            "median_interval": 0.0, "std_dev": 0.0, "p95": 0.0,
+            "longest_gap": 0.0, "gap_count": 0, "quality": "NO_PHOTOS",
+            "cluster_size": 0, "excluded_count": 0,
+        }
+        photo_intervals_png = None
+        photo_histogram_png = None
 
     _report(progress_callback, 88, "Сопоставление фото со спутниками...")
     csv_path = os.path.join(runner.reports_dir, f"{name}_photo_satellite_report.csv")
@@ -424,7 +601,7 @@ def run_pipeline_ubx(ubx_file, progress_callback=None, basemap=None):
     good_count = photo_result["good"]
     normal_count = photo_result["normal"]
     low_count = photo_result["low"]
-    good_percent = (good_count / len(report)) * 100
+    good_percent = (good_count / len(report)) * 100 if report else 0.0
 
     _report(progress_callback, 91, "Построение траектории с метками фото...")
     photo_points = [
@@ -465,9 +642,20 @@ def run_pipeline_ubx(ubx_file, progress_callback=None, basemap=None):
 
         "good_percent": good_percent,
 
-        "avg_satellites": sum(r["satellites"] for r in report) / len(report),
-        "min_satellites": min(r["satellites"] for r in report),
-        "max_satellites": max(r["satellites"] for r in report),
+        # With no photos to correlate against, fall back to the satellite
+        # stats over the whole recording rather than dividing by zero.
+        "avg_satellites": (
+            sum(r["satellites"] for r in report) / len(report)
+            if report else sat_result["avg_satellites"]
+        ),
+        "min_satellites": (
+            min(r["satellites"] for r in report)
+            if report else sat_result["min_satellites"]
+        ),
+        "max_satellites": (
+            max(r["satellites"] for r in report)
+            if report else sat_result["max_satellites"]
+        ),
 
         "photo_count": len(report),
         "flight_duration_min": time_result["duration_sec"] / 60,

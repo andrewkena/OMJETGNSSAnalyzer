@@ -17,7 +17,7 @@ from core.pipeline import run_pipeline
 from plots.map_widget import MapWidget, BASEMAP_KEYS, DEFAULT_BASEMAP
 from plots.height_profile_widget import HeightProfileWidget
 
-APP_VERSION = "0.27_30.09.2026"
+APP_VERSION = "0.28_30.09.2026"
 APP_AUTHOR = "andrewkena"
 
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -1944,8 +1944,8 @@ class MultitrackWindow:
         points = []
         try:
             if path.lower().endswith(".ubx"):
-                from core.pipeline import _ubx_extract_trajectory, _ubx_fallback_week
-                ref_week = _ubx_fallback_week(path)
+                from core.pipeline import _ubx_extract_trajectory, _ubx_ref_week
+                ref_week = _ubx_ref_week(path)
                 points, _ = _ubx_extract_trajectory(path, ref_week)
             else:
                 from core.novatel.reader import iter_messages

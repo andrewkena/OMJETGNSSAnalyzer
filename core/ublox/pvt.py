@@ -2,32 +2,7 @@ import struct
 import math
 from datetime import datetime, timedelta
 
-FIX_NONE = 0
-FIX_DEAD_RECKONING = 1
-FIX_2D = 2
-FIX_3D = 3
-FIX_GNSS_DR = 4
-FIX_TIME_ONLY = 5
-
-
-def _pos_type(fix_type, diff_soln, carr_soln):
-    if fix_type == FIX_NONE:
-        return "NONE"
-    if fix_type == FIX_DEAD_RECKONING:
-        return "DEAD_RECKONING"
-    if fix_type == FIX_2D:
-        return "TYPE_2D"
-    if fix_type == FIX_TIME_ONLY:
-        return "TIME_ONLY"
-
-    # fix_type is 3D or GNSS+dead-reckoning -- carrSoln tells us the RTK
-    # ambiguity state, mirroring the Novatel BESTPOS labels so reports read
-    # the same regardless of receiver brand.
-    if carr_soln == 2:
-        return "NARROW_INT"
-    if carr_soln == 1:
-        return "NARROW_FLOAT"
-    return "PSRDIFF" if diff_soln else "SINGLE"
+from core.ublox.pos_type import classify_pos_type
 
 
 def decode_navpvt(payload):
@@ -69,7 +44,7 @@ def decode_navpvt(payload):
         "lat_sigma": horiz_sigma,
         "lon_sigma": horiz_sigma,
         "height_sigma": height_sigma,
-        "pos_type": _pos_type(fix_type, diff_soln, carr_soln),
+        "pos_type": classify_pos_type(fix_type, diff_soln, carr_soln),
         "num_svs": numSV,
         "num_soln_svs": numSV,
         "pdop": pDOP * 0.01,

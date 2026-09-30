@@ -57,6 +57,26 @@ WGS84_A = 6378137.0
 WGS84_E2 = 6.69437999014e-3
 
 
+def ecef_to_lla(x, y, z):
+    """Bowring's closed-form ECEF -> WGS84 lat/lon/height (degrees, metres)."""
+    b = WGS84_A * math.sqrt(1 - WGS84_E2)
+    ep2 = (WGS84_A ** 2 - b ** 2) / b ** 2
+
+    p = math.hypot(x, y)
+    theta = math.atan2(z * WGS84_A, p * b)
+
+    lat = math.atan2(
+        z + ep2 * b * math.sin(theta) ** 3,
+        p - WGS84_E2 * WGS84_A * math.cos(theta) ** 3,
+    )
+    lon = math.atan2(y, x)
+
+    n = WGS84_A / math.sqrt(1 - WGS84_E2 * math.sin(lat) ** 2)
+    height = p / math.cos(lat) - n
+
+    return math.degrees(lat), math.degrees(lon), height
+
+
 def lla_to_ecef(lat_deg, lon_deg, height_m):
     lat = math.radians(lat_deg)
     lon = math.radians(lon_deg)
